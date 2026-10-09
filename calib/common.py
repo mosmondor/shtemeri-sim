@@ -60,6 +60,11 @@ class Terrain:
         gy = ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / self.cell
         return gx, gy
 
+    def grad_cd(self, x, y, h=0.5):
+        """Central difference of the interpolated height with half step h (the server's slope gradient, h = 0.5)."""
+        return ((self.height(x + h, y) - self.height(x - h, y)) / (2 * h),
+                (self.height(x, y + h) - self.height(x, y - h)) / (2 * h))
+
 
 def rep_for(mid):
     """Replay for a telemetry file: local test-match copy first, then the ranked archive."""
