@@ -99,3 +99,7 @@ The simulator is only as good as its measurements. `METHODOLOGY.md` explains whe
 faithfulness is checked (same-setup runs, the telemetry driver, scripted fleets) and what is still an assumption.
 If you measure something better, or find a difference from the server, open an issue or a pull request with the
 sample size and the error.
+
+## License
+
+MIT, see `LICENSE`.
