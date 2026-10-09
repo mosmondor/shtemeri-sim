@@ -27,6 +27,10 @@ public static class Meter
 
     public static long Used => _used;
 
+    /// <summary>True when the instance being metered has used more than its limit (an overrun that fleet code or a
+    /// BCL wrapper turned into some other exception is still an overrun).</summary>
+    public static bool Exceeded => _used > _limit;
+
     public static void Step(int cost)
     {
         if (!_armed) return;

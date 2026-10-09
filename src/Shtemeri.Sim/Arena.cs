@@ -17,7 +17,7 @@ public sealed class Arena : IArena
     private readonly double _maxHeight;
     private readonly double _losStep;
 
-    public Arena(double size, int gridN, double[] heights, IEnumerable<Obstacle> obstacles, double losStep = 0.25)
+    public Arena(double size, int gridN, double[] heights, IEnumerable<Obstacle> obstacles, double losStep = 0.5)
     {
         if (heights.Length != gridN * gridN) throw new ArgumentException("heights must have gridN*gridN values");
         Size = size; GridN = gridN; Heights = heights;
@@ -45,19 +45,13 @@ public sealed class Arena : IArena
         return a * (1 - ty) + b * ty;
     }
 
-    /// <summary>Gradient of the bilinear patch under the point (metres of height per metre).</summary>
-    public Vec2 Gradient(double x, double y)
+    /// <summary>Terrain gradient as the server computes it for the slope force: central differences of the
+    /// interpolated height with half step <paramref name="h"/> (review F5: h = 0.5 fits server telemetry, the analytic
+    /// gradient of the bilinear cell does not).</summary>
+    public Vec2 Gradient(double x, double y, double h = 0.5)
     {
-        double fx = x / _cell, fy = y / _cell, lim = GridN - 1 - 1e-9;
-        if (fx < 0) fx = 0; else if (fx > lim) fx = lim;
-        if (fy < 0) fy = 0; else if (fy > lim) fy = lim;
-        int ix = (int)fx, iy = (int)fy;
-        double tx = fx - ix, ty = fy - iy;
-        int i = iy * GridN + ix;
-        double h00 = Heights[i], h10 = Heights[i + 1], h01 = Heights[i + GridN], h11 = Heights[i + GridN + 1];
-        double gx = ((h10 - h00) * (1 - ty) + (h11 - h01) * ty) / _cell;
-        double gy = ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / _cell;
-        return new Vec2(gx, gy);
+        double inv = 1.0 / (2 * h);
+        return new Vec2((Height(x + h, y) - Height(x - h, y)) * inv, (Height(x, y + h) - Height(x, y - h)) * inv);
     }
 
     public bool IsBlocked(Vec2 p)
@@ -93,9 +87,10 @@ public sealed class Arena : IArena
             if (px * px + py * py < _or[k] * _or[k]) return false;
         }
         if (az > _maxHeight && bz > _maxHeight) return true;
+        // n = ceil(L / step) intervals, terrain sampled at k/n, k = 1..n-1 (review F8)
         double len = Math.Sqrt(l2);
-        int n = Math.Max(2, (int)(len / _losStep));
-        double inv = 1.0 / n;
+        int n = (int)Math.Ceiling(len / _losStep);
+        double inv = n > 0 ? 1.0 / n : 0;
         for (int k = 1; k < n; k++)
         {
             double f = k * inv;
@@ -106,15 +101,20 @@ public sealed class Arena : IArena
         return true;
     }
 
-    /// <summary>A plain generated arena: smooth hills from a sum of Gaussian bumps (0..8 m) and 6 to 10 rocks.</summary>
-    public static Arena Generate(Rng rng, SimRules rules)
+    /// <summary>
+    /// A generated arena, shaped after the server's arenas (review F11, 10 404 ranked arenas): terrain is a sum of
+    /// Gaussian bumps shifted to start at 0 and cut to [0, 8] (not rescaled); 8 to 14 rocks (uniform), radius 1.2-3.0,
+    /// every rock edge at least 2.5 m from the walls and from other rocks and at least 6 m from each fleet's spawn
+    /// centre (<paramref name="spawnCentres"/>; no other excluded band).
+    /// </summary>
+    public static Arena Generate(Rng rng, SimRules rules, IReadOnlyList<Vec2>? spawnCentres = null)
     {
         int n = 101; double size = rules.ArenaSize;
         var h = new double[n * n];
-        int bumps = 6 + rng.Next(6);
+        int bumps = 15 + rng.Next(7);
         var bx = new double[bumps]; var by = new double[bumps]; var bs = new double[bumps]; var ba = new double[bumps];
-        for (int b = 0; b < bumps; b++) { bx[b] = rng.Range(0, size); by[b] = rng.Range(0, size); bs[b] = rng.Range(8, 22); ba[b] = rng.Range(1.5, 6); }
-        double max = 0;
+        for (int b = 0; b < bumps; b++) { bx[b] = rng.Range(0, size); by[b] = rng.Range(0, size); bs[b] = rng.Range(5.2, 13.3); ba[b] = rng.Range(1.7, 4.5); }
+        double min = double.MaxValue;
         for (int iy = 0; iy < n; iy++)
             for (int ix = 0; ix < n; ix++)
             {
@@ -124,19 +124,21 @@ public sealed class Arena : IArena
                     double ddx = x - bx[b], ddy = y - by[b];
                     v += ba[b] * Math.Exp(-(ddx * ddx + ddy * ddy) / (2 * bs[b] * bs[b]));
                 }
-                h[iy * n + ix] = v; max = Math.Max(max, v);
+                h[iy * n + ix] = v; min = Math.Min(min, v);
             }
-        double scale = max > 0 ? 8.0 / max : 0;
-        for (int i = 0; i < h.Length; i++) h[i] = Math.Round(h[i] * scale, 2);
+        double offset = min + rng.Range(0.05, 0.10);
+        for (int i = 0; i < h.Length; i++) h[i] = Math.Round(Math.Clamp(h[i] - offset, 0, 8), 2);
+
+        const double Gap = 2.5, SpawnClear = 6;
         var rocks = new List<Obstacle>();
-        int count = 6 + rng.Next(5);
-        for (int tries = 0; rocks.Count < count && tries < 500; tries++)
+        int count = 8 + rng.Next(7);
+        for (int tries = 0; rocks.Count < count && tries < 5000; tries++)
         {
-            var c = new Vec2(rng.Range(5, size - 5), rng.Range(5, size - 5));
-            double r = rng.Range(1.2, 3.0);
-            if (Math.Abs(c.DistanceTo(new Vec2(size / 2, size / 2)) - rules.SpawnRingRadius) < r + 6) continue;   // keep the spawn ring free
-            if (rocks.Any(o => o.Center.DistanceTo(c) < o.Radius + r + 3)) continue;
-            rocks.Add(new Obstacle(new Vec2(Math.Round(c.X, 2), Math.Round(c.Y, 2)), Math.Round(r, 2)));
+            double r = Math.Round(rng.Range(1.2, 3.0), 2);
+            var c = new Vec2(Math.Round(rng.Range(r + Gap, size - r - Gap), 2), Math.Round(rng.Range(r + Gap, size - r - Gap), 2));
+            if (rocks.Any(o => o.Center.DistanceTo(c) < o.Radius + r + Gap)) continue;
+            if (spawnCentres != null && spawnCentres.Any(sc => sc.DistanceTo(c) - r < SpawnClear)) continue;
+            rocks.Add(new Obstacle(c, r));
         }
         return new Arena(size, n, h, rocks, rules.LosStep);
     }

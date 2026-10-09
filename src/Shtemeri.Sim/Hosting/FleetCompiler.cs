@@ -33,7 +33,7 @@ public sealed class FleetProgram
 /// </summary>
 public static class FleetCompiler
 {
-    private const string InstrumentationVersion = "budget-v1";
+    private const string InstrumentationVersion = "budget-v2";
     private static readonly object Gate = new();
     private static readonly Dictionary<string, Type> Loaded = new();
     private static ImmutableArray<MetadataReference> _refs;
@@ -83,14 +83,17 @@ public static class FleetCompiler
     {
         var parse = new CSharpParseOptions(LanguageVersion.CSharp12);
         var tree = CSharpSyntaxTree.ParseText(source, parse, path: label, encoding: Encoding.UTF8);
-        var root = (CompilationUnitSyntax)new BudgetRewriter(CostScale).Visit(tree.GetRoot());
-        tree = CSharpSyntaxTree.Create(root, parse, label, Encoding.UTF8);
         // The server accepts fleets that rely on these namespaces; a fleet that also declares them only gets a warning.
         var usings = CSharpSyntaxTree.ParseText(
             "global using System;\nglobal using System.Linq;\nglobal using System.Collections.Generic;\n", parse);
         var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
             optimizationLevel: OptimizationLevel.Release, nullableContextOptions: NullableContextOptions.Enable,
             allowUnsafe: false, concurrentBuild: true);
+        // expression bodies need to know whether they return a value: mark them from the semantic model first
+        var probe = CSharpCompilation.Create(assemblyName + "_probe", new[] { tree, usings }, References(), options);
+        var marked = BudgetRewriter.MarkExpressionBodies(tree.GetRoot(), probe.GetSemanticModel(tree));
+        var root = (CompilationUnitSyntax)new BudgetRewriter(CostScale).Visit(marked);
+        tree = CSharpSyntaxTree.Create(root, parse, label, Encoding.UTF8);
         var comp = CSharpCompilation.Create(assemblyName, new[] { tree, usings }, References(), options);
         using var ms = new MemoryStream();
         var result = comp.Emit(ms);
@@ -121,14 +124,65 @@ public static class FleetCompiler
 /// <summary>
 /// Inserts <c>Meter.Step(n)</c> at the start of every block, n being a rough IL estimate of the block's own statements
 /// (syntax nodes of those statements, not counting nested blocks). Loop bodies that are single statements are wrapped
-/// in blocks first, so every loop iteration pays. Expression-bodied members and expression lambdas are not metered
-/// (an undercount; such code is usually short). The estimate is coarse by design: it only has to stop runaway code and
-/// put a fleet in the right range of the 50 000 budget.
+/// in blocks first, so every loop iteration pays. Expression bodies (<c>=&gt; expr</c> methods, local functions,
+/// properties, accessors, operators and lambdas) are turned into blocks that pay the same way (review H2: before, a
+/// LINQ selector or a recursive <c>=&gt;</c> method ran unmetered). Lambdas converted to expression trees are left
+/// alone. The estimate is coarse by design: it only has to stop runaway code and put a fleet in the right range of the
+/// 50 000 budget.
 /// </summary>
 public sealed class BudgetRewriter : CSharpSyntaxRewriter
 {
+    private const string Mark = "shtemeri-meter";
+    private const string Value = "value", Void = "void";
     private readonly double _scale;
     public BudgetRewriter(double scale) { _scale = scale; }
+
+    /// <summary>Annotates every expression body with whether it returns a value ("value") or not ("void").
+    /// Expression bodies without an annotation (expression trees, unresolved lambdas) are not rewritten.</summary>
+    public static SyntaxNode MarkExpressionBodies(SyntaxNode root, SemanticModel model)
+    {
+        var marks = new Dictionary<SyntaxNode, string>();
+        foreach (var node in root.DescendantNodes())
+        {
+            switch (node)
+            {
+                case LambdaExpressionSyntax { ExpressionBody: not null } lambda:
+                {
+                    var conv = model.GetTypeInfo(lambda).ConvertedType;
+                    if (conv?.ContainingNamespace?.ToDisplayString() == "System.Linq.Expressions") break;
+                    if (model.GetSymbolInfo(lambda).Symbol is IMethodSymbol m) marks[lambda] = Returns(m) ? Value : Void;
+                    break;
+                }
+                case MethodDeclarationSyntax { ExpressionBody: not null } md:
+                    if (model.GetDeclaredSymbol(md) is IMethodSymbol mm) marks[md] = Returns(mm) ? Value : Void;
+                    break;
+                case LocalFunctionStatementSyntax { ExpressionBody: not null } lf:
+                    if (model.GetDeclaredSymbol(lf) is IMethodSymbol lm) marks[lf] = Returns(lm) ? Value : Void;
+                    break;
+            }
+        }
+        return root.ReplaceNodes(marks.Keys, (orig, cur) => cur.WithAdditionalAnnotations(new SyntaxAnnotation(Mark, marks[orig])));
+    }
+
+    private static bool Returns(IMethodSymbol m)
+    {
+        if (m.ReturnsVoid) return false;
+        // async Task / ValueTask without a result: the body is a statement
+        if (m.IsAsync && m.ReturnType is INamedTypeSymbol { IsGenericType: false }) return false;
+        return true;
+    }
+
+    private static string? MarkOf(SyntaxNode n) => n.GetAnnotations(Mark).FirstOrDefault()?.Data;
+
+    private BlockSyntax Metered(ExpressionSyntax original, ExpressionSyntax visited, bool returns)
+    {
+        StatementSyntax st = visited is ThrowExpressionSyntax te
+            ? SyntaxFactory.ThrowStatement(te.Expression)
+            : returns ? SyntaxFactory.ReturnStatement(visited.WithLeadingTrivia(SyntaxFactory.Space)) : SyntaxFactory.ExpressionStatement(visited);
+        int cost = Math.Max(1, (int)Math.Round((Count(original) + (original is InvocationExpressionSyntax ? 3 : 1)) * _scale));
+        var step = SyntaxFactory.ParseStatement($"global::Shtemeri.Sim.Runtime.Meter.Step({cost});");
+        return SyntaxFactory.Block(step, st);
+    }
 
     public override SyntaxNode? VisitBlock(BlockSyntax node)
     {
@@ -136,6 +190,93 @@ public sealed class BudgetRewriter : CSharpSyntaxRewriter
         int cost = Math.Max(1, (int)Math.Round(Cost(node) * _scale));
         var step = SyntaxFactory.ParseStatement($"global::Shtemeri.Sim.Runtime.Meter.Step({cost});");
         return visited.WithStatements(visited.Statements.Insert(0, step));
+    }
+
+    public override SyntaxNode? VisitSimpleLambdaExpression(SimpleLambdaExpressionSyntax node)
+    {
+        var v = (SimpleLambdaExpressionSyntax)base.VisitSimpleLambdaExpression(node)!;
+        var mark = MarkOf(node);
+        if (node.ExpressionBody == null || mark == null) return v;
+        return v.WithExpressionBody(null).WithBlock(Metered(node.ExpressionBody, v.ExpressionBody!, mark == Value));
+    }
+
+    public override SyntaxNode? VisitParenthesizedLambdaExpression(ParenthesizedLambdaExpressionSyntax node)
+    {
+        var v = (ParenthesizedLambdaExpressionSyntax)base.VisitParenthesizedLambdaExpression(node)!;
+        var mark = MarkOf(node);
+        if (node.ExpressionBody == null || mark == null) return v;
+        return v.WithExpressionBody(null).WithBlock(Metered(node.ExpressionBody, v.ExpressionBody!, mark == Value));
+    }
+
+    public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node)
+    {
+        var v = (MethodDeclarationSyntax)base.VisitMethodDeclaration(node)!;
+        var mark = MarkOf(node);
+        if (node.ExpressionBody == null || mark == null) return v;
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithBody(Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, mark == Value));
+    }
+
+    public override SyntaxNode? VisitLocalFunctionStatement(LocalFunctionStatementSyntax node)
+    {
+        var v = (LocalFunctionStatementSyntax)base.VisitLocalFunctionStatement(node)!;
+        var mark = MarkOf(node);
+        if (node.ExpressionBody == null || mark == null) return v;
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithBody(Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, mark == Value));
+    }
+
+    public override SyntaxNode? VisitOperatorDeclaration(OperatorDeclarationSyntax node)
+    {
+        var v = (OperatorDeclarationSyntax)base.VisitOperatorDeclaration(node)!;
+        if (node.ExpressionBody == null) return v;
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithBody(Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, true));
+    }
+
+    public override SyntaxNode? VisitConversionOperatorDeclaration(ConversionOperatorDeclarationSyntax node)
+    {
+        var v = (ConversionOperatorDeclarationSyntax)base.VisitConversionOperatorDeclaration(node)!;
+        if (node.ExpressionBody == null) return v;
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithBody(Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, true));
+    }
+
+    public override SyntaxNode? VisitConstructorDeclaration(ConstructorDeclarationSyntax node)
+    {
+        var v = (ConstructorDeclarationSyntax)base.VisitConstructorDeclaration(node)!;
+        if (node.ExpressionBody == null) return v;
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithBody(Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, false));
+    }
+
+    public override SyntaxNode? VisitPropertyDeclaration(PropertyDeclarationSyntax node)
+    {
+        var v = (PropertyDeclarationSyntax)base.VisitPropertyDeclaration(node)!;
+        if (node.ExpressionBody == null) return v;
+        var get = SyntaxFactory.AccessorDeclaration(SyntaxKind.GetAccessorDeclaration,
+            Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, true));
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithAccessorList(SyntaxFactory.AccessorList(SyntaxFactory.SingletonList(get)));
+    }
+
+    public override SyntaxNode? VisitIndexerDeclaration(IndexerDeclarationSyntax node)
+    {
+        var v = (IndexerDeclarationSyntax)base.VisitIndexerDeclaration(node)!;
+        if (node.ExpressionBody == null) return v;
+        var get = SyntaxFactory.AccessorDeclaration(SyntaxKind.GetAccessorDeclaration,
+            Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, true));
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithAccessorList(SyntaxFactory.AccessorList(SyntaxFactory.SingletonList(get)));
+    }
+
+    public override SyntaxNode? VisitAccessorDeclaration(AccessorDeclarationSyntax node)
+    {
+        var v = (AccessorDeclarationSyntax)base.VisitAccessorDeclaration(node)!;
+        if (node.ExpressionBody == null) return v;
+        bool returns = node.IsKind(SyntaxKind.GetAccessorDeclaration);
+        return v.WithExpressionBody(null).WithSemicolonToken(default)
+                .WithBody(Metered(node.ExpressionBody.Expression, v.ExpressionBody!.Expression, returns));
     }
 
     public override SyntaxNode? VisitForStatement(ForStatementSyntax node) =>

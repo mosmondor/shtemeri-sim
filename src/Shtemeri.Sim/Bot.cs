@@ -9,6 +9,8 @@ internal sealed class Bot
     public Shtemer Code = null!;
     public Agent Agent = null!;
     public Rng Random = null!;
+    /// <summary>Noise of this shtemer's blips (its own stream).</summary>
+    public Rng Noise = null!;
     public bool Alive = true, Started;
 
     public Vec2 Pos, Vel, Thrust;

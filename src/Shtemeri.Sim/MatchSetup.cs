@@ -19,8 +19,10 @@ public sealed class MatchSetup
     /// <summary>Zone circles: [0] is the start circle, [i] the circle stage i shrinks to (replay v1 zoneStages).</summary>
     public required IReadOnlyList<(Vec2 Center, double Radius)> ZoneStages { get; init; }
     public required IReadOnlyList<LootSeed> InitialLoot { get; init; }
-    /// <summary>Boxes the server spawned at a tick (replay mode). Ticks without an entry are generated.</summary>
+    /// <summary>Boxes the server spawned at a tick (replay mode). Ticks without an entry get no boxes.</summary>
     public IReadOnlyDictionary<int, IReadOnlyList<LootSeed>> ScheduledLoot { get; init; } = new Dictionary<int, IReadOnlyList<LootSeed>>();
+    /// <summary>Replay mode: spawned boxes come only from <see cref="ScheduledLoot"/>; nothing is generated (review H3).</summary>
+    public bool LootFromSchedule { get; init; }
     /// <summary>Angle (from the arena centre) of each slot's fleet centre. Slot i plays at SlotAngles[i].</summary>
     public required IReadOnlyList<double> SlotAngles { get; init; }
     /// <summary>Fleet names per slot in the source replay (empty when generated).</summary>
@@ -32,8 +34,14 @@ public sealed class MatchSetup
     public static MatchSetup Generate(ulong seed, int fleets, SimRules rules, Arena? arena = null, string origin = "generated")
     {
         var rng = Rng.Derive(seed, 0xA11CE);
-        arena ??= Arena.Generate(rng, rules);
-        var stages = new List<(Vec2, double)> { (new Vec2(rules.ArenaSize / 2, rules.ArenaSize / 2), rules.ZoneStartRadius) };
+        // slots first: generated rocks keep clear of the fleet spawn centres
+        double start = rng.Range(-Math.PI, Math.PI);
+        var order = Enumerable.Range(0, fleets).ToArray();
+        for (int i = order.Length - 1; i > 0; i--) { int j = rng.Next(i + 1); (order[i], order[j]) = (order[j], order[i]); }
+        var angles = order.Select(k => Vec2.NormalizeAngle(start + 2 * Math.PI * k / fleets)).ToArray();
+        var centre = new Vec2(rules.ArenaSize / 2, rules.ArenaSize / 2);
+        arena ??= Arena.Generate(rng, rules, angles.Select(a => centre + Vec2.FromAngle(a) * rules.SpawnRingRadius).ToList());
+        var stages = new List<(Vec2, double)> { (centre, rules.ZoneStartRadius) };
         double r = rules.ZoneStartRadius;
         for (int k = 1; k <= rules.ZoneStages; k++)
         {
@@ -43,25 +51,38 @@ public sealed class MatchSetup
             stages.Add((new Vec2(Math.Round(c.X, 2), Math.Round(c.Y, 2)), nr));
             r = nr;
         }
+        // initial boxes (server: always 10, 3 m from the walls, 8 m apart, at least 5.15 m from every shtemer)
+        var bodies = angles.SelectMany(a => SpawnPositions(a, rules)).ToList();
         var loot = new List<LootSeed>();
+        double s2 = rules.LootInitialSpacing * rules.LootInitialSpacing, b2 = rules.LootInitialBodyClearance * rules.LootInitialBodyClearance;
         for (int i = 0; i < rules.LootInitialBoxes; i++)
         {
-            Vec2 p = default;
-            for (int tries = 0; tries < 100; tries++)
+            for (int tries = 0; tries < 10000; tries++)
             {
-                p = new Vec2(rng.Range(rules.LootWallMargin, rules.ArenaSize - rules.LootWallMargin),
-                             rng.Range(rules.LootWallMargin, rules.ArenaSize - rules.LootWallMargin));
+                var p = new Vec2(rng.Range(rules.LootWallMargin, rules.ArenaSize - rules.LootWallMargin),
+                                 rng.Range(rules.LootWallMargin, rules.ArenaSize - rules.LootWallMargin));
                 if (arena.InsideRock(p.X, p.Y, rules.LootRockClearance) >= 0) continue;
-                double s2 = rules.LootInitialSpacing * rules.LootInitialSpacing;
-                if (loot.All(l => (l.Position - p).LengthSquared >= s2)) break;
+                if (bodies.Any(q => (q - p).LengthSquared < b2)) continue;
+                if (loot.Any(l => (l.Position - p).LengthSquared < s2)) continue;
+                loot.Add(new LootSeed(PickKind(rng, rules), p));
+                break;
             }
-            loot.Add(new LootSeed(PickKind(rng, rules), p));
         }
-        double start = rng.Range(-Math.PI, Math.PI);
-        var order = Enumerable.Range(0, fleets).ToArray();
-        for (int i = order.Length - 1; i > 0; i--) { int j = rng.Next(i + 1); (order[i], order[j]) = (order[j], order[i]); }
-        var angles = order.Select(k => Vec2.NormalizeAngle(start + 2 * Math.PI * k / fleets)).ToArray();
         return new MatchSetup { Seed = seed, Arena = arena, ZoneStages = stages, InitialLoot = loot, SlotAngles = angles, Origin = origin };
+    }
+
+    /// <summary>Start positions of a fleet's shtemers: around the fleet centre on the spawn ring, radially in/out and
+    /// tangentially (index i at offset (1 + i / 4) times the member offset).</summary>
+    public static Vec2[] SpawnPositions(double angle, SimRules rules)
+    {
+        var centre = new Vec2(rules.ArenaSize / 2, rules.ArenaSize / 2);
+        var u = Vec2.FromAngle(angle); var v = new Vec2(-u.Y, u.X);
+        var fc = centre + u * rules.SpawnRingRadius;
+        double o = rules.SpawnMemberOffset;
+        var offsets = new[] { -u * o, -v * o, u * o, v * o };
+        var pos = new Vec2[rules.FleetSize];
+        for (int i = 0; i < pos.Length; i++) pos[i] = fc + offsets[i % 4] * (1 + i / 4);
+        return pos;
     }
 
     public static LootKind PickKind(Rng rng, SimRules rules)
@@ -162,7 +183,7 @@ public sealed class MatchSetup
         return new MatchSetup
         {
             Seed = (ulong)root.GetProperty("seed").GetInt64(),
-            Arena = arena, ZoneStages = stages, InitialLoot = initial, ScheduledLoot = scheduled, SlotAngles = angles,
+            Arena = arena, ZoneStages = stages, InitialLoot = initial, ScheduledLoot = scheduled, LootFromSchedule = true, SlotAngles = angles,
             Origin = "replay " + Path.GetFileName(path),
             FleetNames = root.GetProperty("fleets").EnumerateArray().Select(f => f.GetProperty("name").GetString() ?? "?").ToList(),
         };

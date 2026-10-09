@@ -14,7 +14,7 @@ shtemeri-sim: local Shtemeri arena. Runs C# fleets (the same source the server t
   shtemeri-sim [options]
 
 Fleets (2 to 8):
-  --fleet Name=path.cs        add a fleet (repeat); the same file may appear twice
+  --fleet Name=path.cs        add a fleet (repeat); the same file or name may appear twice (shown as Name#2)
   --fleets file.txt           lines "Name=path.cs" (# comments); relative paths are relative to the file
 
 Arena, zone and boxes:
@@ -29,7 +29,7 @@ Running:
   --rotate                    rotate the fleets through the slots from game to game
   --out PATH                  replay JSON of a single match (.json or .json.gz)
   --out-dir DIR               replay of every match as DIR/<seed>.json.gz
-  --results FILE              one JSON line per match (placements and stats)
+  --results FILE              one JSON line per match (placements, stats; "entries": input index of each slot)
   --telemetry DIR             telemetry v1 of every fleet as DIR/<seed>.slot<k>.jsonl.gz (server layout)
   --drive TEL.jsonl.gz        semantics check: feed one fleet (--fleet, --replay) the inputs recorded in a server
                               telemetry file and compare its commands with the recorded ones
@@ -100,8 +100,12 @@ var rules = SimRules.Season;
 var sw = Stopwatch.StartNew();
 var programs = new List<FleetEntry>();
 var scriptStats = new ScriptedFleet.Stats();
-foreach (var (name, path) in fleetSpecs)
+var seenNames = new Dictionary<string, int>();
+foreach (var (specName, path) in fleetSpecs)
 {
+    // a fleet is identified by its input index; a repeated name is shown as Name#2, Name#3, ... (as in replays)
+    seenNames[specName] = seenNames.GetValueOrDefault(specName) + 1;
+    string name = seenNames[specName] > 1 ? $"{specName}#{seenNames[specName]}" : specName;
     try
     {
         var prog = path.EndsWith(".jsonl.gz", StringComparison.OrdinalIgnoreCase)
@@ -133,6 +137,7 @@ MatchSetup SetupFor(ulong s)
 }
 
 var results = new MatchResult[games];
+var entries = new int[games][];   // per game: input index of the fleet in each slot
 sw.Restart();
 long ticksTotal = 0;
 Parallel.For(0, games, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, threads) }, g =>
@@ -140,6 +145,7 @@ Parallel.For(0, games, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1
     ulong s = seed + (ulong)g;
     var order = Enumerable.Range(0, programs.Count).Select(k => rotate ? (k + g) % programs.Count : k).ToList();
     var fleets = order.Select(k => programs[k]).ToList();
+    entries[g] = order.ToArray();
     var match = new Match(SetupFor(s), fleets, rules, new MatchOptions
     {
         RecordReplay = outPath != null || outDir != null, EnforceBudget = budget, MaxTicks = maxTicks, RngSeed = s,
@@ -171,16 +177,18 @@ Parallel.For(0, games, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1
 double secs = sw.Elapsed.TotalSeconds;
 
 if (games == 1 && !quiet) PrintMatch(results[0]);
-PrintSummary(results, programs.Select(p => p.Name).ToList());
+PrintSummary(results, entries, programs.Select(p => p.Name).ToList());
 if (scriptStats.FiresRequested > 0) Console.WriteLine($"scripted fires: {scriptStats.FiresRequested}, refused locally {scriptStats.FiresRefused}");
 Console.WriteLine($"{games} matches in {secs:0.0} s: {games / secs:0.00} matches/s, {ticksTotal / secs:0} ticks/s ({threads} threads)");
 
 if (resultsPath != null)
 {
     using var w = new StreamWriter(resultsPath, false, new UTF8Encoding(false));
-    foreach (var r in results)
+    for (int g = 0; g < results.Length; g++)
     {
+        var r = results[g];
         w.Write($"{{\"seed\":{r.Seed},\"ticks\":{r.TotalTicks},\"fleets\":[{string.Join(",", r.FleetNames.Select(n => "\"" + n.Replace("\"", "'") + "\""))}],");
+        w.Write($"\"entries\":[{string.Join(",", entries[g])}],");
         w.Write($"\"placements\":[{string.Join(",", r.Placements)}],\"stats\":[");
         w.Write(string.Join(",", r.Stats.Select(s =>
             $"{{\"fleet\":{s.Fleet},\"place\":{s.Place},\"kills\":{s.Kills},\"damageDealt\":{s.DamageDealt:0.0},\"damageTaken\":{s.DamageTaken:0.0}," +
@@ -224,18 +232,19 @@ static void PrintMatch(MatchResult r)
     }
 }
 
-static void PrintSummary(MatchResult[] results, List<string> names)
+static void PrintSummary(MatchResult[] results, int[][] entries, List<string> names)
 {
     if (results.Length < 2) return;
-    var byName = names.Distinct().ToDictionary(n => n, _ => new List<int>());
-    var dealt = names.Distinct().ToDictionary(n => n, _ => 0.0);
-    foreach (var r in results)
-        for (int slot = 0; slot < r.FleetNames.Count; slot++)
+    var places = names.Select(_ => new List<int>()).ToArray();
+    var dealt = new double[names.Count];
+    for (int g = 0; g < results.Length; g++)
+        for (int slot = 0; slot < results[g].FleetNames.Count; slot++)
         {
-            byName[r.FleetNames[slot]].Add(r.Stats[slot].Place);
-            dealt[r.FleetNames[slot]] += r.Stats[slot].DamageDealt;
+            int e = entries[g][slot];
+            places[e].Add(results[g].Stats[slot].Place);
+            dealt[e] += results[g].Stats[slot].DamageDealt;
         }
     Console.WriteLine($"{"fleet",-14} {"games",5} {"wins",5} {"win%",6} {"avg place",9} {"avg dealt",9}");
-    foreach (var (n, places) in byName.OrderBy(kv => kv.Value.Average()))
-        Console.WriteLine($"{n,-14} {places.Count,5} {places.Count(p => p == 1),5} {100.0 * places.Count(p => p == 1) / places.Count,6:0.0} {places.Average(),9:0.00} {dealt[n] / places.Count,9:0.0}");
+    foreach (int e in Enumerable.Range(0, names.Count).OrderBy(e => places[e].Average()))
+        Console.WriteLine($"{names[e],-14} {places[e].Count,5} {places[e].Count(p => p == 1),5} {100.0 * places[e].Count(p => p == 1) / places[e].Count,6:0.0} {places[e].Average(),9:0.00} {dealt[e] / places[e].Count,9:0.0}");
 }

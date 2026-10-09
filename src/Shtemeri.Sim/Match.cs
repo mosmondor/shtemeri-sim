@@ -40,13 +40,14 @@ public sealed class FleetStats
 /// <summary>
 /// The deterministic match engine. One call to <see cref="Run"/> plays a whole match.
 ///
-/// Tick order (calibrated against server telemetry, NOTES.md):
+/// Tick order (calibrated against server telemetry and replays, NOTES.md and METHODOLOGY.md):
 /// 1. every living shtemer gets its senses (blips from the state at the start of the tick, answers to last tick's zooms),
 ///    then OnStart (first tick), OnMessage, OnHit, OnCollision, OnTick, sharing one instruction budget;
-/// 2. projectiles are created from the shooters' start-of-tick positions;
-/// 3. energy regenerates, the vision cone turns, shtemers move and collide;
-/// 4. projectiles fly (hits are checked against the moved shtemers), rockets explode;
-/// 5. zone damage, pickups, deaths and box drops, eliminations, scheduled boxes, cooldowns.
+/// 2. projectiles are created at the muzzles (start-of-tick positions);
+/// 3. energy regenerates, the vision cone turns, shtemers move and collide (rocks and walls, pairs, rocks and walls);
+/// 4. projectiles fly (hits are checked against the moved shtemers that still have health), rockets explode;
+/// 5. weapon deaths and their box drops, pickups, spawned boxes, zone damage, zone deaths and their drops,
+///    eliminations (once per tick), cooldowns.
 /// </summary>
 public sealed class Match
 {
@@ -61,7 +62,11 @@ public sealed class Match
     private readonly MatchSetup _setup;
     private readonly IReadOnlyList<FleetEntry> _fleets;
     private readonly MatchOptions _opt;
-    private readonly Rng _rng;
+    // Separate random streams (one per observer for blip noise, one for generated boxes with a fixed number of draws
+    // per spawn tick), so that a change in one fleet does not shift the luck of the others: paired comparisons of two
+    // versions on the same seeds have less noise. Each stream is still a deterministic function of the seed.
+    private readonly Rng _lootRng;
+    private readonly double[] _startHp;   // fleet health at the start of the current tick (ranks same-tick eliminations)
     private readonly ReplayRecorder? _rec;
     private readonly FleetStats[] _stats;
     private readonly List<Projectile> _projectiles = new();
@@ -90,31 +95,29 @@ public sealed class Match
         Arena = setup.Arena;
         FleetArena = new MeteredArena(Arena, Rules);
         ulong rngSeed = _opt.RngSeed ?? setup.Seed;
-        _rng = Rng.Derive(rngSeed, 0xB10B);
+        _lootRng = Rng.Derive(rngSeed, 0x1007);
         _dt = 1.0 / Rules.TicksPerSecond;
         _maxTicks = _opt.MaxTicks ?? Rules.MaxTicks;
         int n = Rules.FleetSize;
         Bots = new Bot[fleets.Count * n];
         _stats = new FleetStats[fleets.Count];
         _fleetAlive = new bool[fleets.Count];
+        _startHp = new double[fleets.Count];
         var centre = new Vec2(Rules.ArenaSize / 2, Rules.ArenaSize / 2);
         for (int s = 0; s < fleets.Count; s++)
         {
             _stats[s] = new FleetStats { Fleet = s };
             _fleetAlive[s] = true;
-            double a = setup.SlotAngles[s];
-            var u = Vec2.FromAngle(a); var v = new Vec2(-u.Y, u.X);
-            var fc = centre + u * Rules.SpawnRingRadius;
-            double o = Rules.SpawnMemberOffset;
-            var offsets = new[] { -u * o, -v * o, u * o, v * o };
+            var start = MatchSetup.SpawnPositions(setup.SlotAngles[s], Rules);
             for (int i = 0; i < n; i++)
             {
                 var b = new Bot
                 {
                     Gid = s * n + i, Slot = s, Index = i,
-                    Pos = fc + offsets[i % 4] * (1 + i / 4),
+                    Pos = start[i],
                     Hp = Rules.MaxHealth, Energy = Rules.MaxEnergy,
                     Random = Rng.Derive(rngSeed, 1000 + (ulong)(s * n + i)),
+                    Noise = Rng.Derive(rngSeed, 0xB10B0000UL + (ulong)(s * n + i)),
                 };
                 b.Look = b.LookTarget = (centre - b.Pos).Angle;
                 b.Ammo[0] = Rules.PistolStartAmmo; b.Ammo[1] = Rules.RocketStartAmmo;
@@ -144,15 +147,18 @@ public sealed class Match
         for (Tick = 0; Tick < _maxTicks; Tick++)
         {
             lastTick = Tick;
+            RememberStartHealth();
             ThinkAll();
             foreach (var tr in _tel.Values) tr.EndTick();
             ApplyCommands();
             Physics();
             Projectiles();
-            ZoneDamage();
+            KillDead();          // weapon deaths: before pickups (a dying shtemer takes no box), drops before the spawn
             Pickups();
-            bool over = Deaths();
-            SpawnLoot();
+            SpawnLoot();         // cap: 16 minus the boxes left after pickups and weapon drops
+            ZoneDamage();        // living shtemers only
+            KillDead();          // zone deaths: their drops get ids after the spawned boxes
+            bool over = Eliminations();
             EndOfTick();
             if (_rec != null && (Tick % 2 == 0 || over || Tick == _maxTicks - 1)) RecordFrame();
             if (over) break;
@@ -198,10 +204,11 @@ public sealed class Match
                 foreach (var c in b.Collisions) b.Code.OnCollision(b.Agent, c);
                 b.Code.OnTick(b.Agent, senses);
             }
-            catch (BudgetExceededException) { st.BudgetExceeded++; }
             catch (Exception e)
             {
-                if (e is System.Reflection.TargetInvocationException { InnerException: BudgetExceededException }) st.BudgetExceeded++;
+                // Classified by the meter, not by the exception type: a budget overrun inside a callback the BCL
+                // calls (a Sort comparer, a LINQ selector) arrives wrapped in another exception (review H2).
+                if (e is BudgetExceededException || (_opt.EnforceBudget && Meter.Exceeded)) st.BudgetExceeded++;
                 else { st.Errors++; st.FirstError ??= $"t{Tick} #{b.Index}: {e.GetType().Name}: {e.Message}"; }
             }
             finally
@@ -277,7 +284,7 @@ public sealed class Match
         if (!b.BlipIds.TryGetValue(key, out int id)) id = b.NextBlipId++;
         b.NextBlipIds[key] = id;
         double dist = truePos.DistanceTo(b.Pos);
-        var p = truePos + _rng.InDisk(dist * Rules.BlipNoise);
+        var p = truePos + b.Noise.InDisk(dist * Rules.BlipNoise);
         var rel = p - b.Pos;
         b.Blips.Add(new Blip(id, p, rel.Length, rel.Angle, size));
         b.BlipKeyById[id] = key;
@@ -340,11 +347,15 @@ public sealed class Match
 
     private void Spawn(Bot b, Weapon w, Vec2 target)
     {
-        double mx = b.Pos.X, my = b.Pos.Y, mz = Arena.Height(mx, my) + Rules.MuzzleHeight;
-        double tx = target.X, ty = target.Y, tz = Arena.Height(tx, ty) + Rules.TargetHeight;
-        double dx = tx - mx, dy = ty - my, dz = tz - mz;
-        double hl = Math.Sqrt(dx * dx + dy * dy);
-        if (hl < 1e-6) { dx = Math.Cos(b.Look); dy = Math.Sin(b.Look); dz = 0; hl = 1; }
+        // Muzzle 1.1 m from the centre, horizontally towards the target, at ground + 1.2; the projectile flies from the
+        // muzzle to (target, ground(target) + 1.0) (review F4a). Range counts from the muzzle (calib/range.py).
+        double hx = target.X - b.Pos.X, hy = target.Y - b.Pos.Y, hl = Math.Sqrt(hx * hx + hy * hy);
+        if (hl < 1e-6) { hx = Math.Cos(b.Look); hy = Math.Sin(b.Look); hl = 1; }
+        hx /= hl; hy /= hl;
+        double mx = b.Pos.X + hx * Rules.MuzzleOffset, my = b.Pos.Y + hy * Rules.MuzzleOffset;
+        double mz = Arena.Height(b.Pos.X, b.Pos.Y) + Rules.MuzzleHeight;
+        double dx = target.X - mx, dy = target.Y - my, dz = Arena.Height(target.X, target.Y) + Rules.TargetHeight - mz;
+        if (dx * dx + dy * dy < 1e-12) { dx = hx; dy = hy; dz = 0; }
         double len = Math.Sqrt(dx * dx + dy * dy + dz * dz);
         dx /= len; dy /= len; dz /= len;
         bool rocket = w == Weapon.Rocket;
@@ -353,11 +364,11 @@ public sealed class Match
             Id = _nextProjectileId++, Kind = rocket ? 1 : 0, Owner = b.Gid,
             Dx = dx, Dy = dy, Dz = dz,
             Speed = (rocket ? Rules.RocketSpeed : Rules.PistolSpeed) * _dt,
-            X = mx + dx * Rules.MuzzleOffset, Y = my + dy * Rules.MuzzleOffset, Z = mz + dz * Rules.MuzzleOffset,
-            Traveled = Rules.MuzzleOffset,
-            // range counts from the muzzle (server: rockets end at most 46.1 m from the shooter's centre on the
-            // 50th move, pistol bullets hit up to 31.1 m on the 15th; calib/range.py)
-            MaxTravel = rocket ? Math.Min(Rules.MuzzleOffset + Rules.RocketRange, len) : Rules.MuzzleOffset + Rules.PistolRange,
+            X = mx, Y = my, Z = mz,
+            Traveled = 0,
+            // server: rockets end at most 46.1 m from the shooter's centre on the 50th move, pistol bullets hit up to
+            // 31.1 m on the 15th
+            MaxTravel = rocket ? Math.Min(Rules.RocketRange, len) : Rules.PistolRange,
         };
         _projectiles.Add(p);
     }
@@ -374,7 +385,7 @@ public sealed class Match
             d = Math.Clamp(d, -Rules.LookTurnRate, Rules.LookTurnRate);
             b.Look = Vec2.NormalizeAngle(b.Look + d);
 
-            var g = Arena.Gradient(b.Pos.X, b.Pos.Y);
+            var g = Arena.Gradient(b.Pos.X, b.Pos.Y, Rules.SlopeGradientStep);
             bool parked = b.Thrust.X == 0 && b.Thrust.Y == 0 && b.Vel.Length < Rules.ParkingSpeed
                           && Rules.SlopeAcceleration * g.Length < Rules.ParkingSlopeForce;
             if (parked) b.Vel = Vec2.Zero;
@@ -390,63 +401,59 @@ public sealed class Match
 
     private void ResolveCollisions()
     {
-        double R = Rules.ShtemerRadius, size = Rules.ArenaSize;
-        var obs = Arena.Obstacles;
-        // One pass, as on the server: in a crowd some overlap is left (server: 12.6 % of touching pairs closer than
-        // 1.99 m, minimum 1.84 m), and it is resolved over the next ticks.
-        for (int pass = 0; pass < 1; pass++)
+        // As on the server (review F7): rocks and walls (with events), shtemer pairs in one pass (with events; in a
+        // crowd some overlap is left and resolved over the next ticks), then rocks and walls again without events.
+        // A shtemer's collision list therefore has obstacle/wall events before shtemer events.
+        foreach (var b in Bots) if (b.Alive) ResolveStatic(b, true);
+        double R = Rules.ShtemerRadius;
+        for (int i = 0; i < Bots.Length; i++)
         {
-            bool report = pass == 0;
-            // shtemer pairs: push apart, perfectly inelastic along the normal
-            for (int i = 0; i < Bots.Length; i++)
+            var a = Bots[i]; if (!a.Alive) continue;
+            for (int j = i + 1; j < Bots.Length; j++)
             {
-                var a = Bots[i]; if (!a.Alive) continue;
-                for (int j = i + 1; j < Bots.Length; j++)
+                var c = Bots[j]; if (!c.Alive) continue;
+                var dv = a.Pos - c.Pos; double d2 = dv.LengthSquared;
+                if (d2 >= 4 * R * R) continue;
+                double d = Math.Sqrt(d2);
+                var n = d > 1e-9 ? dv / d : Vec2.FromAngle(a.Gid);
+                double push = (2 * R - d) / 2;
+                a.Pos += n * push; c.Pos -= n * push;
+                double va = a.Vel.Dot(n), vc = c.Vel.Dot(n);
+                if (va - vc < 0)
                 {
-                    var c = Bots[j]; if (!c.Alive) continue;
-                    var dv = a.Pos - c.Pos; double d2 = dv.LengthSquared;
-                    if (d2 >= 4 * R * R) continue;
-                    double d = Math.Sqrt(d2);
-                    var n = d > 1e-9 ? dv / d : Vec2.FromAngle(a.Gid);
-                    double push = (2 * R - d) / 2;
-                    a.Pos += n * push; c.Pos -= n * push;
-                    double va = a.Vel.Dot(n), vc = c.Vel.Dot(n);
-                    if (va - vc < 0)
-                    {
-                        double avg = (va + vc) / 2;
-                        a.Vel += n * (avg - va); c.Vel += n * (avg - vc);
-                    }
-                    if (report)
-                    {
-                        a.NextCollisions.Add(new CollisionEvent(CollisionKind.Shtemer, n));
-                        c.NextCollisions.Add(new CollisionEvent(CollisionKind.Shtemer, -n));
-                    }
+                    double avg = (va + vc) / 2;
+                    a.Vel += n * (avg - va); c.Vel += n * (avg - vc);
                 }
-            }
-            foreach (var b in Bots)
-            {
-                if (!b.Alive) continue;
-                for (int k = 0; k < obs.Count; k++)
-                {
-                    var dv = b.Pos - obs[k].Center; double lim = obs[k].Radius + R;
-                    double d2 = dv.LengthSquared;
-                    if (d2 >= lim * lim) continue;
-                    double d = Math.Sqrt(d2);
-                    var n = d > 1e-9 ? dv / d : new Vec2(1, 0);
-                    b.Pos = obs[k].Center + n * lim;
-                    double vn = b.Vel.Dot(n);
-                    if (vn < 0) b.Vel -= n * vn;
-                    if (report) b.NextCollisions.Add(new CollisionEvent(CollisionKind.Obstacle, n));
-                }
-                Wall(b, ref report, b.Pos.X < R, new Vec2(1, 0), new Vec2(R, b.Pos.Y));
-                Wall(b, ref report, b.Pos.X > size - R, new Vec2(-1, 0), new Vec2(size - R, b.Pos.Y));
-                Wall(b, ref report, b.Pos.Y < R, new Vec2(0, 1), new Vec2(b.Pos.X, R));
-                Wall(b, ref report, b.Pos.Y > size - R, new Vec2(0, -1), new Vec2(b.Pos.X, size - R));
+                a.NextCollisions.Add(new CollisionEvent(CollisionKind.Shtemer, n));
+                c.NextCollisions.Add(new CollisionEvent(CollisionKind.Shtemer, -n));
             }
         }
+        foreach (var b in Bots) if (b.Alive) ResolveStatic(b, false);
     }
 
-    private static void Wall(Bot b, ref bool report, bool hit, Vec2 n, Vec2 clamped)
+    private void ResolveStatic(Bot b, bool report)
+    {
+        double R = Rules.ShtemerRadius, size = Rules.ArenaSize;
+        var obs = Arena.Obstacles;
+        for (int k = 0; k < obs.Count; k++)
+        {
+            var dv = b.Pos - obs[k].Center; double lim = obs[k].Radius + R;
+            double d2 = dv.LengthSquared;
+            if (d2 >= lim * lim) continue;
+            double d = Math.Sqrt(d2);
+            var n = d > 1e-9 ? dv / d : new Vec2(1, 0);
+            b.Pos = obs[k].Center + n * lim;
+            double vn = b.Vel.Dot(n);
+            if (vn < 0) b.Vel -= n * vn;
+            if (report) b.NextCollisions.Add(new CollisionEvent(CollisionKind.Obstacle, n));
+        }
+        Wall(b, report, b.Pos.X < R, new Vec2(1, 0), new Vec2(R, b.Pos.Y));
+        Wall(b, report, b.Pos.X > size - R, new Vec2(-1, 0), new Vec2(size - R, b.Pos.Y));
+        Wall(b, report, b.Pos.Y < R, new Vec2(0, 1), new Vec2(b.Pos.X, R));
+        Wall(b, report, b.Pos.Y > size - R, new Vec2(0, -1), new Vec2(b.Pos.X, size - R));
+    }
+
+    private static void Wall(Bot b, bool report, bool hit, Vec2 n, Vec2 clamped)
     {
         if (!hit) return;
         b.Pos = clamped;
@@ -484,7 +491,9 @@ public sealed class Match
                 {
                     foreach (var b in Bots)
                     {
-                        if (!b.Alive) continue;
+                        // a shtemer whose health already fell to 0 this tick is no longer a target (review F3):
+                        // bullets fly through it, later splash does not touch it
+                        if (!b.Alive || b.Hp <= 0) continue;
                         double dx = p.X - b.Pos.X, dy = p.Y - b.Pos.Y;
                         if (dx * dx + dy * dy > R * R) continue;
                         double hz = Arena.Height(b.Pos.X, b.Pos.Y);
@@ -503,7 +512,8 @@ public sealed class Match
                     else
                     {
                         // as on the server: the explosion (splash to everyone, the victim included) comes first,
-                        // then the direct hit (event and OnHit order: boom, splash hits, direct hit)
+                        // then the direct hit (event and OnHit order: boom, splash hits, direct hit); the direct hit
+                        // lands even when the rocket's own splash was lethal
                         Explode(p);
                         Damage(victim, p.Owner, Weapon.Rocket, Rules.RocketDirectDamage, false, dir);
                     }
@@ -524,7 +534,7 @@ public sealed class Match
         var c = new Vec2(p.X, p.Y);
         foreach (var b in Bots)
         {
-            if (!b.Alive) continue;
+            if (!b.Alive || b.Hp <= 0) continue;
             double d = b.Pos.DistanceTo(c);
             if (d >= Rules.RocketSplashRadius) continue;
             double dmg = Rules.RocketSplashDamage * (1 - d / Rules.RocketSplashRadius);
@@ -534,14 +544,18 @@ public sealed class Match
 
     private void Damage(Bot victim, int by, Weapon w, double dmg, bool splash, Vec2 dir)
     {
+        bool hadHealth = victim.Hp > 0;
         victim.Hp -= dmg;
         victim.NextHits.Add(new HitEvent(dmg, w, splash, dir));
-        victim.LastDamager = by;
-        victim.LastCause = w == Weapon.Pistol ? "pistol" : "rocket";
+        // cause and killer are those of the hit that first takes health to 0 and are never overwritten (review F3e)
+        if (hadHealth && victim.Hp <= 0) { victim.LastDamager = by; victim.LastCause = w == Weapon.Pistol ? "pistol" : "rocket"; }
         _stats[victim.Slot].DamageTaken += dmg;
         var shooter = Bots[by];
-        if (shooter.Slot != victim.Slot) _stats[shooter.Slot].DamageDealt += dmg;
-        if (by != victim.Gid) _stats[shooter.Slot].Hits++;
+        if (shooter.Slot != victim.Slot)
+        {
+            _stats[shooter.Slot].DamageDealt += dmg;
+            if (!splash) _stats[shooter.Slot].Hits++;   // server: hits = direct (non-splash) hits on other fleets (F10)
+        }
         _rec?.Event(Tick, "hit", ("s", victim.Gid), ("by", by), ("w", (int)w), ("d", dmg), ("splash", splash));
     }
 
@@ -571,6 +585,7 @@ public sealed class Match
 
     private void ZoneDamage()
     {
+        // living shtemers only (weapon deaths are already removed), so "zone" is the cause only when this damage is lethal
         var z = ZoneAt(Tick);
         foreach (var b in Bots)
         {
@@ -612,10 +627,21 @@ public sealed class Match
         }
     }
 
-    /// <summary>Removes the dead, drops their boxes, eliminates fleets. Returns true when the match is over.</summary>
-    private bool Deaths()
+    /// <summary>Health of each fleet at the start of the tick (living shtemers), the first key for ranking fleets
+    /// eliminated in the same tick (review F2).</summary>
+    private void RememberStartHealth()
     {
-        var eliminatedNow = new List<int>();
+        for (int s = 0; s < _startHp.Length; s++)
+        {
+            double h = 0;
+            for (int i = 0; i < Rules.FleetSize; i++) { var b = Bots[s * Rules.FleetSize + i]; if (b.Alive) h += Math.Max(0, b.Hp); }
+            _startHp[s] = h;
+        }
+    }
+
+    /// <summary>Removes shtemers whose health is at 0 or below, in body-index order, and drops their boxes.</summary>
+    private void KillDead()
+    {
         foreach (var b in Bots)
         {
             if (!b.Alive || b.Hp > 0) continue;
@@ -625,6 +651,12 @@ public sealed class Match
             if (by >= 0 && Bots[by].Slot != b.Slot) _stats[Bots[by].Slot].Kills++;
             _boxes.Add(new Box { Id = _nextBoxId++, Kind = b.Ammo[1] > 0 ? LootKind.Rockets : LootKind.Ammo, Pos = b.Pos });
         }
+    }
+
+    /// <summary>Eliminates fleets with no shtemer left, once per tick. Returns true when the match is over.</summary>
+    private bool Eliminations()
+    {
+        var eliminatedNow = new List<int>();
         for (int s = 0; s < _fleets.Count; s++)
         {
             if (!_fleetAlive[s]) continue;
@@ -634,8 +666,14 @@ public sealed class Match
         }
         if (eliminatedNow.Count > 0)
         {
-            // eliminated together: ranked by remaining health (zero) and then by damage dealt
-            eliminatedNow.Sort((x, y) => _stats[x].DamageDealt.CompareTo(_stats[y].DamageDealt));
+            // eliminated together (server, review F2): higher fleet health at the start of the tick places better,
+            // then more damage dealt, then the lower slot. The list runs from the worst place up.
+            eliminatedNow.Sort((x, y) =>
+            {
+                int c = _startHp[x].CompareTo(_startHp[y]);
+                if (c == 0) c = _stats[x].DamageDealt.CompareTo(_stats[y].DamageDealt);
+                return c != 0 ? c : y.CompareTo(x);
+            });
             int stillAlive = _fleetAlive.Count(a => a);
             for (int k = 0; k < eliminatedNow.Count; k++)
             {
@@ -652,33 +690,38 @@ public sealed class Match
     {
         if (Tick == 0 || Tick % Rules.LootSpawnInterval != 0) return;
         int count = Math.Min(Rules.LootSpawnCount, Rules.LootMaxBoxes - _boxes.Count);
-        if (count <= 0) return;
-        _setup.ScheduledLoot.TryGetValue(Tick, out var scheduled);
-        var z = ZoneAt(Tick);
-        for (int i = 0; i < count; i++)
+        if (_setup.LootFromSchedule)
         {
-            LootSeed seed;
-            if (scheduled != null && i < scheduled.Count) seed = scheduled[i];
-            else
+            // replay mode: only the boxes the server spawned at this tick (none if it spawned none), up to the cap
+            // (review H3: generating the missing ones made late loot too plentiful)
+            if (count <= 0 || !_setup.ScheduledLoot.TryGetValue(Tick, out var scheduled)) return;
+            for (int i = 0; i < Math.Min(count, scheduled.Count); i++)
+                _boxes.Add(new Box { Id = _nextBoxId++, Kind = scheduled[i].Kind, Pos = scheduled[i].Position });
+            return;
+        }
+        // Every spawn tick draws the same amount from the loot stream (LootSpawnCount boxes x LootSpawnTries places + a
+        // kind), whatever the cap and wherever a place is found, so the stream stays aligned between paired matches.
+        var z = ZoneAt(Tick);
+        double sp2 = Rules.LootSpawnSpacing * Rules.LootSpawnSpacing;
+        for (int i = 0; i < Rules.LootSpawnCount; i++)
+        {
+            // As on the server (calib/latelot3.py, review F1): a spawned box keeps 4 m from every other box (those of
+            // this batch included) and 1.5 m from rocks; a box that finds no such place in its tries is not spawned.
+            // In a small zone (R < 2.2, R = 0 after t = 2700) at most one box fits, so late spawns are 0-1 instead of 3.
+            Vec2? found = null;
+            for (int tries = 0; tries < Rules.LootSpawnTries; tries++)
             {
-                // As on the server (calib/latelot3.py): a spawned box keeps 4 m from every other box and 1.5 m from
-                // rocks; a box that finds no such place in its tries is not spawned. In a small zone (R < 2.2,
-                // R = 0 after t = 2700) at most one box fits, so late spawns are 0-1 instead of 3.
-                Vec2? found = null;
-                double sp2 = Rules.LootSpawnSpacing * Rules.LootSpawnSpacing;
-                for (int tries = 0; tries < Rules.LootSpawnTries && found == null; tries++)
-                {
-                    var p = z.Center + _rng.InDisk(z.Radius * Rules.LootSpawnZoneFraction);
-                    if (p.X < 1 || p.Y < 1 || p.X > Rules.ArenaSize - 1 || p.Y > Rules.ArenaSize - 1) continue;
-                    if (Arena.InsideRock(p.X, p.Y, Rules.LootRockClearance) >= 0) continue;
-                    bool near = false;
-                    foreach (var o in _boxes) if ((o.Pos - p).LengthSquared < sp2) { near = true; break; }
-                    if (!near) found = p;
-                }
-                if (found == null) continue;
-                seed = new LootSeed(MatchSetup.PickKind(_rng, Rules), found.Value);
+                var p = z.Center + _lootRng.InDisk(z.Radius * Rules.LootSpawnZoneFraction);
+                if (found != null || i >= count) continue;
+                if (p.X < 1 || p.Y < 1 || p.X > Rules.ArenaSize - 1 || p.Y > Rules.ArenaSize - 1) continue;
+                if (Arena.InsideRock(p.X, p.Y, Rules.LootRockClearance) >= 0) continue;
+                bool near = false;
+                foreach (var o in _boxes) if ((o.Pos - p).LengthSquared < sp2) { near = true; break; }
+                if (!near) found = p;
             }
-            _boxes.Add(new Box { Id = _nextBoxId++, Kind = seed.Kind, Pos = seed.Position });
+            var kind = MatchSetup.PickKind(_lootRng, Rules);
+            if (found == null) continue;
+            _boxes.Add(new Box { Id = _nextBoxId++, Kind = kind, Pos = found.Value });
         }
     }
 

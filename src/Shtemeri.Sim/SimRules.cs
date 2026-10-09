@@ -83,26 +83,32 @@ public sealed class SimRules : IRules
     public int CostLog { get; init; } = 20;
 
     // ---- calibrated (NOTES.md, stage 2) ----
-    /// <summary>Projectiles appear this far from the shooter's centre, towards the target.</summary>
+    /// <summary>The muzzle is this far from the shooter's centre, horizontally towards the target, at ground + MuzzleHeight.</summary>
     public double MuzzleOffset { get; init; } = 1.1;
     /// <summary>Collision checks along a projectile's path are made at most this far apart.</summary>
     public double ProjectileSubstep { get; init; } = 0.5;
-    /// <summary>Step of the terrain sampling in line-of-sight tests.</summary>
-    public double LosStep { get; init; } = 0.25;
+    /// <summary>Terrain sampling in line-of-sight tests: n = ceil(L / LosStep) intervals, samples at k/n, k = 1..n-1
+    /// (review F8: fewer wrong pairs than finer sampling).</summary>
+    public double LosStep { get; init; } = 0.5;
     /// <summary>Loot spawns uniformly inside this fraction of the current zone radius.</summary>
     public double LootSpawnZoneFraction { get; init; } = 0.9;
     /// <summary>Minimum clearance between a spawned box and the edge of a rock.</summary>
     public double LootRockClearance { get; init; } = 1.5;
     /// <summary>A spawned box keeps at least this far from every box on the map (server: minimum 4.0 m).</summary>
     public double LootSpawnSpacing { get; init; } = 4.0;
-    /// <summary>Random places tried per spawned box; a box with no valid place is not spawned.</summary>
-    public int LootSpawnTries { get; init; } = 40;
+    /// <summary>Random places tried per spawned box; a box with no valid place is not spawned
+    /// (Monte Carlo log-likelihood over 7 896 non-trivial server spawn contexts: best near 60).</summary>
+    public int LootSpawnTries { get; init; } = 60;
     /// <summary>Initial boxes keep at least this far from each other (server: minimum 8.0 m).</summary>
     public double LootInitialSpacing { get; init; } = 8.0;
     /// <summary>Initial boxes keep this far from the arena wall.</summary>
     public double LootWallMargin { get; init; } = 3.0;
-    /// <summary>Kind probabilities of spawned boxes: Ammo, Rockets, Repair.</summary>
-    public double[] LootKindWeights { get; init; } = { 0.457, 0.298, 0.245 };
+    /// <summary>Kind probabilities of boxes: Ammo, Rockets, Repair (387 428 server boxes: 0.451 / 0.298 / 0.251).</summary>
+    public double[] LootKindWeights { get; init; } = { 0.45, 0.30, 0.25 };
+    /// <summary>Initial boxes keep at least this far from every shtemer at the start (server: minimum 5.15 m).</summary>
+    public double LootInitialBodyClearance { get; init; } = 5.2;
+    /// <summary>Gradient of the terrain for the slope force: central difference with this half step (review F5).</summary>
+    public double SlopeGradientStep { get; init; } = 0.5;
     /// <summary>Fleet members sit this far from the fleet centre (radially in/out and tangentially).</summary>
     public double SpawnMemberOffset { get; init; } = 2 * Math.Sqrt(2);
 
