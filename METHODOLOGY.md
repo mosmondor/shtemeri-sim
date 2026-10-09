@@ -61,13 +61,18 @@ Each line gives the model, the evidence and the error. Script names are in `cali
 **Movement** (`movement2.py`; 39 406 tick pairs, collision ticks excluded). Semi-implicit Euler, dt = 0.05:
 
 ```
-a  = 12·thrust − 1.5·v − 6·∇h      thrust clamped to length 1, ∇h = gradient of the bilinear surface
+a  = 12·thrust − 1.5·v − 6·∇h      thrust clamped to length 1
+∇h = ((h(x+0.5, y) − h(x−0.5, y)), (h(x, y+0.5) − h(x, y−0.5)))   central difference of the interpolated height, step 0.5
 v' = v + a·dt
 x' = x + v'·dt
 parking: thrust exactly 0, |v| < 0.5 at the start of the tick and 6·|∇h| < 3  →  v' = 0
 ```
 
-A free regression gives 12.006 / 1.500 / 5.976. Speed error: mean 0.0055 m/s, p99 0.014. Every large residual
+A free regression gives 12.006 / 1.500 / 5.976 with the analytic gradient of the bilinear cell. The slope
+coefficient fitted alone (24 097 moving samples) is 5.978 with the cell gradient and 5.998 with the central
+difference above; on 67 315 free-flight samples of 15 telemetries the cell gradient leaves 399 samples (0.59 %)
+outside the rounding bound, central differences with a step of 0.45–0.55 leave 0–1 (section 7). The same gradient
+is used for parking. Speed error: mean 0.0055 m/s, p99 0.014. Every large residual
 was a tick where the telemetry rounded a small non-zero thrust to 0.00, so parking needs a thrust of exactly zero.
 Rejected variants: implicit drag (error 0.020), exponential drag (0.010), position from the old speed (0.014 m).
 There is no hard speed cap (the highest speed measured was 7.78 m/s).
@@ -81,6 +86,10 @@ There is no hard speed cap (the highest speed measured was 7.78 m/s).
   closer than 2.3 m that are below 1.99 m are 20.9 % on the server and 19.7 % locally with one pass (three passes
   were too strict).
 - Wall: no wall contact appears in any telemetry. Assumed: clamp to [1, 99] and remove the speed into the wall.
+- Order within a tick: rocks and walls (with events), shtemer pairs (one pass, with events), rocks and walls again
+  without events. In a shtemer's collision list the obstacle/wall events come before the shtemer events (137 of 137
+  mixed lists in server telemetry). Whether this order also moves positions differently could not be shown with
+  rounded telemetry (53 usable cases, none above the noise).
 
 **Look and energy** (`look_energy.py`, 45 044 ticks). `look' = look + clamp(target − look, ±0.21)`, error 0.
 `energy' = min(100, energy − 8·zooms + 0.4)`, error 0 on every tick. The server keeps energy as a double, takes it
@@ -95,23 +104,31 @@ at the moment of `Zoom`, and regenerates at the end of the tick. Cooldowns drop 
 - Cone: angle ≤ 0.87 rad from the look direction at the start of the tick, range 32 m.
 - Line of sight: from the eye (ground + 1.6) to ground + **1.0** above the target, blocked by terrain under the ray
   and by rocks (2D circle, infinitely tall). Agreement with telemetry: 99.95 % with 1.0, against 88.8 % (0.0),
-  97.7 % (1.6), 96.5 % (2.0). Boxes: 99.9 % with 1.0.
+  97.7 % (1.6), 96.5 % (2.0). Boxes: 99.9 % with 1.0. The terrain is sampled at k/n of the ray, k = 1..n−1,
+  n = ⌈L/0.5⌉: of 58 472 observer–shtemer pairs (in cone and range, clear of rocks) this rule gets 22 wrong, the
+  earlier max(2, ⌊L/0.25⌋) 35 and a fine 0.02 m sampling 43.
 - Blip ids count per observer (1, 2, 3, …); an object that leaves the view and comes back gets a new id.
 - Zoom answer: position and velocity at the start of the next tick (error 0.000), only if the object is still
   visible (94–100 % of zooms answered).
 
 **Projectiles** (`proj2.py`, `proj3.py`, `splash.py`, `pistolhits3.py`).
 - Created from the shooter's position at the **start** of the tick (perpendicular error 0.003 m, against 0.08 for
-  the moved position), 1.1 m from the centre towards the aim, at ground + 1.2, and moved one step in the same tick.
-  Along the line: pistol 3.095 m after the first step (sd 0.012), 5.090 after the second; rocket 1.997 / 2.895.
-- Flight: a 3D straight line towards (aim, ground(aim) + 1.0) and onwards with the same slope.
+  the moved position) and moved one step in the same tick. The muzzle is 1.1 m from the centre **horizontally**
+  towards the aim, at ground(centre) + 1.2. Along the line: pistol 3.095 m after the first step (sd 0.012), 5.090
+  after the second; rocket 1.997 / 2.895.
+- Flight: a 3D straight line from the muzzle towards (aim, ground(aim) + 1.0) and onwards with the same slope.
+  Projectiles in their first frame (2 moves; `regression.py`, 200 ranked replays, 115 732 projectiles): 3D error
+  median / p95 0.006 / 0.010 m in every pitch band; a muzzle 1.1 m along the sloped line from the centre is off by
+  0.186 / 0.270 m when |pitch| > 0.2 (section 7).
 - Range counts from the muzzle (1.1 m from the centre). A pistol bullet makes at most 15 moves: the 15th takes it
   from 29.1 to 31.1 m from the shooter's centre, it is checked for hits along the whole move and then removed
   (`range.py`; corrected, see section 7). Many bullets end in the terrain before that.
 - A rocket explodes at the aim point, at the first body, in the terrain, or at the end of its range: 46.1 m from the
   shooter's centre, on its 50th move (corrected, section 7).
 - Hit test: a point of the path inside the body cylinder (2D ≤ 1 m, between the ground and ground + 2), against
-  targets **after** they moved, in sub-steps of 0.50 m. Replaying 15 840 bullets of 12 server matches through the
+  targets **after** they moved, in sub-steps of 0.50 m. A shtemer whose health already fell to 0 in this tick is no
+  longer a target: later bullets fly through it and later explosions do not touch it. The one exception is the
+  direct hit of a rocket after its own splash was lethal (section 7). Replaying 15 840 bullets of 12 server matches through the
   model: 98.9 % agreement (0.45 m 98.7 %, 0.67 m 98.6 %, one full 2 m step 89.1 %).
 - Direct rocket hits explode 0.62/0.86/0.98 m (p5/p50/p95) from the target centre on the server, 0.61/0.84/0.99 locally.
 - Splash: `35·(1 − d/5)`, d = 2D distance from the explosion to the centre after movement. Implied distance error
@@ -131,13 +148,31 @@ at the moment of `Zoom`, and regenerates at the end of the tick. Cooldowns drop 
 **Boxes** (`loot.py`, `pickup.py`, `spawn.py`, `dropcontent.py`; 300 matches).
 - 10 boxes at the start anywhere in the arena (3.0–97.0), at least 8.0 m from each other; then 3 every 200 ticks
   inside the current zone (distance/R ≤ 0.90, (r/R)² mean 0.418 against 0.405 for uniform), at least 1.5 m from a
-  rock edge and at least 4.0 m from every box already on the map. A box that finds no such place (40 random tries)
+  rock edge and at least 4.0 m from every box already on the map. A box that finds no such place (60 random tries)
   is not spawned, so in a small zone fewer than 3 appear (`latelot*.py`; corrected, see section 7).
-- Kinds (11 246 boxes): ammo 45.7 %, rockets 29.8 %, repair 24.5 %.
+- Kinds (387 428 boxes, initial and spawned alike): ammo 45.1 %, rockets 29.8 %, repair 25.1 %; the simulator uses
+  0.45 / 0.30 / 0.25 (chi² 5.0, df 2; the earlier 0.457 / 0.298 / 0.245 from 11 246 boxes gives 85.9).
+- Tries per spawned box: 60. Monte Carlo log-likelihood of the spawn counts on 7 896 server spawn contexts where the
+  place matters: K = 40 −874, 50 −844, **60 −838**, 70 −841, 80 −851, 100 −882.
+- Initial boxes are at least 5.15 m from every shtemer at the start (10 404 arenas); the generator uses 5.2 m.
 - A dead shtemer drops one box where it died: rockets if it had at least one, otherwise ammo (33/33), with the
-  standard amount (27/27). Dropped boxes count towards the limit of 16 (spawn 14 → 2, 15 → 1, 16 → 0).
+  standard amount (27/27). Dropped boxes count towards the limit of 16 (spawn 14 → 2, 15 → 1, 16 → 0); the cap is
+  16 minus the boxes left after the pickups and the drops of weapon deaths of that tick (0 of 101 402 server batches
+  break it). Box ids: drops of weapon deaths < spawned boxes < drops of zone deaths of the same tick (953/953, 57/57).
 - Pickup: ≤ 1.8 m from the centre after movement; a box the shtemer does not need stays (a shtemer at full health
   stood within 1.2 m of a repair box 5 247 times and it stayed).
+
+**End of the tick: deaths, pickups, zone, ranking** (`regression.py`; 10 404 ranked replays for the evidence).
+- Order: projectiles → weapon deaths (body-index order) and their drops → pickups (living shtemers only) → spawned
+  boxes → zone damage (living shtemers only) → zone deaths and their drops → eliminations, once per tick.
+- A shtemer killed by a weapon takes no box in that tick (0 pickups by such shtemers; 23 repair boxes within 1.6 m of
+  a weapon death stayed). Repair is taken before zone damage: a capped repair outside the zone ends at
+  250 − zone damage (350/350).
+- Cause and killer are those of the hit that first takes health to 0 and never change: a weapon death outside the
+  zone stays pistol/rocket with the shooter (1 051/1 051); "zone" only when the zone damage itself is lethal.
+- Fleets eliminated in the same tick are ranked by their health at the **start** of the tick (174 groups: 166
+  explained, 0 contradicted, 8 within 0.15), then by damage dealt, then by slot (the server's second key is unknown).
+- `hits` in the result counts direct (non-splash) hits on other fleets (62 336 / 62 336 fleet entries).
 
 **Start.** Six fleets on a ring of radius 40 around (50, 50), 60° apart, random slot order and start angle.
 Members in a diamond around the fleet centre: index 0 radially −2.83, 1 tangentially −2.83, 2 radially +2.83,
@@ -146,7 +181,10 @@ Members in a diamond around the fleet centre: index 0 radially −2.83, 1 tangen
 **Instruction budget.** The server counts IL instructions. The simulator rewrites fleet code with Roslyn: at the
 start of every block it inserts `Meter.Step(n)`, n = the number of syntax nodes of the block's own statements
 (method call × 3, unbraced branch half), scaled by 0.65. Loops without braces are wrapped, `catch` blocks rethrow
-the meter's stop. Expression-bodied members and expression lambdas are not counted (an underestimate). API call
+the meter's stop. Expression bodies (`=> expr` methods, local functions, properties, accessors, operators and
+lambdas) are turned into blocks first, so LINQ selectors and recursion through `=>` methods pay too; lambdas that
+become expression trees are left alone. An exception thrown while the meter is over the limit counts as a budget
+overrun even when the BCL wraps it (a `Sort` comparer turns it into `InvalidOperationException`). API call
 costs (line of sight 60, height 5, log 20) are charged by the engine. Mean spend per tick (server / local) for three
 fleets with very different code: 8 557 / 8 762, 15 819 / 16 153, 1 519 / 1 295.
 
@@ -182,10 +220,19 @@ against 2 621 ± 126 ticks; pickups per match (ammo / rockets / repair) 29.5 / 1
 ## 5. Known gaps and assumptions
 
 - The budget is an estimate (section 3). A fleet near 50 000 will not overrun on the same ticks as on the server.
+  Each block or expression body still pays its whole estimate on entry.
 - The server's random generator is not public. Generated arenas, zones and boxes have the server's statistics, not
   its values for a seed; use `--replay` to play on a real setup. Generated terrain is a sum of Gaussian hills
-  (0–8 m) with 6–10 rocks; `--arenas DIR` takes terrain and rocks from real replays instead.
-- Rocks are assumed infinitely tall; wall contact is assumed (no data).
+  shifted to start at 0 and cut to [0, 8] (200 generated arenas: maximum 8 in 76 %, on the server 58 %; nodes at 0
+  515 on average, server median 392); 8–14 rocks, edges at least 2.5 m from the walls and from each other and 6 m from
+  each fleet's spawn centre, as measured on 10 404 server arenas. `--arenas DIR` takes terrain and rocks from real
+  replays instead; the start slots are still generated there, so a real rock can sit near a generated spawn.
+- `--replay` mode uses only the boxes the server spawned, up to the local cap; the local field differs from the
+  server's, so a server box may sit closer than 4 m to a local one.
+- The simulator's random streams (blip noise per observer, generated boxes with a fixed number of draws per spawn
+  tick, `me.Random` per shtemer) are a design for paired comparisons, not a property of the server.
+- Rocks are assumed infinitely tall; wall contact is assumed (no data). The collision order (section 3) is
+  confirmed for events; its effect on positions needs exact (unrounded) states.
 - Shtemer collisions in crowds are fitted on a statistic, not per collision (section 3). Fleets that push other
   shtemers on purpose should be checked against the server.
 - Rockets fired into a crowd: in some fleets the local rate of rockets fired while an enemy is closer than 4 m was
@@ -203,12 +250,66 @@ against 2 621 ± 126 ticks; pickups per match (ammo / rockets / repair) 29.5 / 1
 4. Keep determinism: same fleets and seed must give a byte-identical replay (`--out` twice, compare hashes).
 5. Report what you measured with the sample size and the error, as above, so the next person can repeat it.
 
-The tick order in `Match.cs`: senses (blips from the state at the start of the tick, zoom answers) → `OnStart`,
-`OnMessage`, `OnHit`, `OnCollision`, `OnTick` under one budget → projectiles from the shooters' start positions →
-energy, look, movement, collisions → projectile flight (hits on moved targets) → zone damage → pickups → deaths, box
-drops, eliminations → box spawn → cooldowns.
+The tick order in `Match.cs`: fleet health remembered → senses (blips from the state at the start of the tick, zoom
+answers) → `OnStart`, `OnMessage`, `OnHit`, `OnCollision`, `OnTick` under one budget → projectiles from the
+shooters' start positions → energy, look, movement, collisions (rocks and walls, pairs, rocks and walls) →
+projectile flight (hits on moved targets that still have health) → weapon deaths and drops → pickups → box spawn →
+zone damage → zone deaths and drops → eliminations → cooldowns. `calib/regression.py` checks these rules on local
+replays (section 7).
 
 ## 7. Corrections
+
+### 2026-10-09 (second): end of the tick, ranking, slope, muzzle, collisions, boxes, budget
+
+Several of these corrections were prompted by an external review by gburazer (9 October 2026); each was re-measured
+on our own data before changing the engine. Data for the evidence: all 10 404 ranked replays available on that day
+(read one at a time) and 15 server telemetries. "Before" is 4c26b24, "after" this version.
+
+| Rule | Evidence on server data | Before → after |
+|---|---|---|
+| A shtemer whose health fell to 0 is no longer a target (bullets fly through, splash skips it) | hits on a shtemer already below −0.15: 0 of 207 373 weapon deaths; bullets crossing the cylinder of a body in its death tick and flying on: 11 801 (control, one tick earlier: 2) | hits after a clearly lethal one in 200 local matches: 271 → 0 (rocket direct hit after its own lethal splash: allowed, 175) |
+| Weapon deaths before pickups; zone only on the living; cause and killer from the first lethal hit | pickups by a shtemer dying from a weapon: 0; cause of weapon deaths outside the zone: 1 051/1 051 pistol/rocket; killer = shooter of the lethal hit 199 009/199 009 | wrong killer 225 → 0, "zone" deaths with lethal hits 19 → 0, pickups by the dying 7 → 0, order of deaths/pickups 83 → 0 (200 matches) |
+| Cap after pickups and weapon drops; id order weapon drop < spawn < zone drop | cap 0/101 402 violations; ids 953/953 and 57/57 | id order in `--replay` runs (192 matches): 6 → 0 violations |
+| Same-tick eliminations by fleet health at the start of the tick | 174 groups: 166 explained, 0 contradicted (damage dealt: 101 contradicted); the old key picked the wrong winner in 0.29 % of matches | 200 + 192 local matches: 1 pair contradicted → 0 (7 pairs in the right order, 3 within 0.3 HP) |
+| Slope gradient: central difference, step 0.5 | 67 315 free-flight samples: outside the rounding bound 399 (cell) vs 0–1 (step 0.45–0.55); slope coefficient 5.978 (cell) vs 5.998 (`movement2.py`) | local telemetry (6 matches, ~133 000 samples): the engine now follows the central difference (residual p99 0.235 vs 0.251 for the cell; before the reverse) |
+| Horizontal muzzle | first-frame error, pistol and rocket, every pitch band: 0.006 / 0.010 m (median / p95) | local first frames off the server model by more than 0.03 m: 58 156 of 95 064 → 0 |
+| Collision order: rocks and walls, pairs, rocks and walls silently | obstacle before shtemer in 137/137 mixed event lists | local telemetry: 1 670/1 670 mixed lists in the wrong order → 0/1 000 |
+| 60 tries per spawned box | log-likelihood −838 (60) vs −874 (40), 7 896 contexts | spacing below 3.98 m: 0 before and after |
+| Box kinds 0.45 / 0.30 / 0.25 | 387 428 boxes: 0.451 / 0.298 / 0.251 | local shares (8 681 boxes) 0.453 / 0.298 / 0.249, chi² 0.29 |
+| Line of sight: n = ⌈L/0.5⌉ terrain samples | wrong pairs 22 vs 35 of 58 472 | half the terrain samples |
+| `hits` = direct hits on other fleets | 62 336 / 62 336 | result `hits` matching that definition: 12 of 1 200 → 1 200 of 1 200 |
+| Generated arenas (8–14 rocks, gaps 2.5 m, 6 m from spawn centres, terrain cut to [0, 8], initial boxes 5.2 m from shtemers) | 10 404 server arenas | 200 generated setups: 456 violations (72 with 6–7 rocks, 202 boxes too close to a shtemer, 129 terrains without a 0) → 0 |
+| `--replay` never generates boxes | the server spawned fewer than min(3, room) in 1 669 batches (T 2600: 70 %) | local boxes not among the server's: 45 → 0; boxes per batch at T 2600: server 0.82, before 0.97, after 0.74 |
+| Budget: expression bodies metered; overrun classified by the meter | (code) | probe fleet, 40 ticks: LINQ and `=>` recursion now overrun (0 → 120 overruns), a `Sort` comparer overrun counted as an error before (40 errors → 0) |
+| Fleets with the same name | (code) | summary and `--results` keep them apart (`Name#2`; `entries` gives the input index per slot) |
+
+**`calib/regression.py`** checks these rules on local replays (and works on server replays too: 0 violations on 200
+ranked and 12 test-match replays). On 200 local matches (6 fleets, `--arenas`): before 59 950 violations, after 0;
+on the 12 test-match setups × 16 (`--replay`): before 60 544, after 0. `--determinism` plays 3 seeds with 1 and 2
+threads, twice, in generated, `--arenas` and `--replay` mode: identical md5 after the change.
+
+**Separate random streams.** Blip noise now has one stream per observer, generated boxes one stream with a fixed
+number of draws per spawn tick. This does not change faithfulness; it makes paired comparisons less noisy. On 300
+paired seeds (one fleet against a variant of it, same 5 opponents), the variance of the paired difference in place
+went from 0.708 to 0.555 (ratio 0.78, bootstrap 95 % 0.53–1.15), survival time 0.90, damage dealt 1.01: in the right
+direction, not significant at this sample size.
+
+**Effect on the same-setup check** (12 server test matches, each setup played 16 times locally with the same seeds
+before and after):
+
+| | server | before | after |
+|---|---|---|---|
+| deaths per match, pistol / rocket / zone | 14.08 / 1.33 / 6.75 | 14.10 / 1.81 / 6.41 (se 0.26 / 0.11 / 0.31) | 14.06 / 1.96 / 6.24 (se 0.27 / 0.13 / 0.33) |
+| pickups per match, ammo / rockets / repair | 30.8 / 18.2 / 9.9 | 30.2 / 19.0 / 10.0 | 29.8 / 19.1 / 10.0 |
+| match length, ticks | 2 648 ± 39 | 2 628 ± 116 | 2 619 ± 147 |
+| server place as a quantile of the local places (0.5 typical), six fleets | | 0.64 0.43 0.50 0.39 0.47 0.48 | 0.65 0.42 0.50 0.40 0.53 0.51 |
+
+The totals moved within their standard errors: these corrections fix rare events (about one per match each) that
+the whole-match statistics of 12 setups cannot resolve; `regression.py` is the check that sees them. In a 6-fleet
+gauntlet the places did move (200 matches, same seeds: one fleet 2.24 → 2.53, another 2.84 → 2.75).
+
+Speed: 200 matches, 2 threads, no replay recording: 11 600–13 600 ticks/s before, 13 600–14 600 after (shared
+machine; fewer terrain samples in line of sight, a few more in the slope gradient).
 
 ### 2026-10-09: late boxes, pistol and rocket range
 
@@ -226,7 +327,7 @@ named.
 - Number of tries: replaying every ranked spawn tick (state from the frame before) through the model with K tries
   per box. For R 4–5 (spawn counts 0/1/2/3 when the cap of 16 does not bind): server 1/2/40/177, K = 30 gives
   1/3/42/174, K = 100 gives 1/2/28/189; for R 5–8 the server has 19 spawns of 2, K = 30 gives 34, K = 100 gives 10.
-  The simulator uses 40.
+  The simulator used 40 (60 since the second correction of that day, above).
 - After R reaches 0 (tick 2700) the spawn point is the zone centre, so at most one box can sit there.
 
 | spawned boxes per spawn tick (mean) | server | before | after |

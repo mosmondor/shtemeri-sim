@@ -30,9 +30,9 @@ Useful options (`--help` lists all):
 | `--seed N`, `--games N` | play seeds N, N+1, ... |
 | `--rotate` | rotate the fleets through the start slots from game to game |
 | `--arenas DIR` | take terrain and rocks from server replays in DIR (one per seed); zone and boxes are generated |
-| `--replay FILE` | replay the setup of one server match: arena, zone circles, the boxes the server spawned, start slots. List the fleets in the server's slot order (the program prints it). With `--games N` the same setup is played with N different random streams |
+| `--replay FILE` | replay the setup of one server match: arena, zone circles, the boxes the server spawned (no others), start slots. List the fleets in the server's slot order (the program prints it). With `--games N` the same setup is played with N different random streams |
 | `--out FILE`, `--out-dir DIR` | write replay JSON v1 (`.json` or `.json.gz`) |
-| `--results FILE` | one JSON line per match: placements and per-fleet stats |
+| `--results FILE` | one JSON line per match: placements, per-fleet stats and `entries` (input index of the fleet in each slot) |
 | `--log FILE` | the fleets' `me.Log` lines of a single match |
 | `--no-budget` | run fleets without the instruction meter |
 
@@ -55,7 +55,8 @@ Measured against server telemetry (exact commands and states of one's own fleet)
   (eye 1.6 m to 1.0 m above the target's ground): 99.95 % agreement on what is seen;
 - pistol hits, replayed bullet by bullet through the hit model: 98.9 % agreement with the server;
 - rocket splash: 35·(1 − d/5) on the 2D distance, error 0.006 m;
-- zone schedule and damage, box spawning, pickups, drops: as on the server (METHODOLOGY.md).
+- zone schedule and damage, box spawning, pickups, drops, the order of deaths and the ranking of fleets eliminated
+  together: as on the server (METHODOLOGY.md); `calib/regression.py` checks these rules on local replays.
 
 With the same setup as a server match, a local match follows the server's positions to about 1 cm for the first
 three seconds, then diverges (the noise of blips and `me.Random` are not the server's). Over six server test matches
@@ -64,7 +65,7 @@ the match length, deaths by cause, pickups and the per-fleet averages agree well
 What is approximate:
 
 - The instruction budget. The server counts IL instructions; the simulator inserts a meter at the start of every
-  block of fleet code and estimates the block's cost from its syntax, scaled to match the server's average spend.
+  block and expression body of fleet code and estimates its cost from its syntax, scaled to match the server's average spend.
   It stops runaway code and puts a fleet in the right range, but a fleet that lives near 50 000 per tick will not
   overrun on exactly the same ticks.
 - The server's random generator is not public: generated arenas, zones and boxes have the right statistics, not the
