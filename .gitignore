@@ -1,0 +1,12 @@
+bin/
+obj/
+out/
+.fleet-cache/
+validation/local/
+calib/*.npy
+calib/*.pkl
+calib/ranked_index.json
+calib/__pycache__/
+data/
+validation/
+calib/telemetry/

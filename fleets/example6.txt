@@ -1,0 +1,6 @@
+Wanderer1=examples/Wanderer.cs
+Wanderer2=examples/Wanderer.cs
+Wanderer3=examples/Wanderer.cs
+Wanderer4=examples/Wanderer.cs
+Wanderer5=examples/Wanderer.cs
+Wanderer6=examples/Wanderer.cs
