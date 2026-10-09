@@ -26,13 +26,12 @@ def bullets(d):
         if L < 1e-6: continue
         u = dv / L; p = np.array([mx, my, mz]) + u * 1.1; trav = 1.1
         pred = None; tk = t; path = []
-        while pred is None and trav <= 30 and tk < t + 16:
+        while pred is None and trav < 31.1 - 1e-9 and tk < t + 16:   # 15 moves: the last one 29.1 -> 31.1 m is checked whole
             n = int(np.ceil(2.0 / SUB)); sub = 2.0 / n
             P = {g: pos_at(fr, tk, g) for g in range(N)}
             a = p.copy()
             for _ in range(n):
                 p = p + u * sub; trav += sub
-                if trav > 30 + 1e-9: break
                 if p[2] < T.height(p[0], p[1]) or not (0 <= p[0] <= 100 and 0 <= p[1] <= 100): pred = ('stop', tk); break
                 if any(np.hypot(p[0] - o[0], p[1] - o[1]) < o[2] for o in obs): pred = ('stop', tk); break
                 for g, q in P.items():

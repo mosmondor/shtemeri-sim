@@ -105,8 +105,11 @@ at the moment of `Zoom`, and regenerates at the end of the tick. Cooldowns drop 
   the moved position), 1.1 m from the centre towards the aim, at ground + 1.2, and moved one step in the same tick.
   Along the line: pistol 3.095 m after the first step (sd 0.012), 5.090 after the second; rocket 1.997 / 2.895.
 - Flight: a 3D straight line towards (aim, ground(aim) + 1.0) and onwards with the same slope.
-- A pistol bullet disappears beyond 30 m; many end in the terrain.
-- A rocket explodes at the aim point, at the first body, or in the terrain.
+- Range counts from the muzzle (1.1 m from the centre). A pistol bullet makes at most 15 moves: the 15th takes it
+  from 29.1 to 31.1 m from the shooter's centre, it is checked for hits along the whole move and then removed
+  (`range.py`; corrected, see section 7). Many bullets end in the terrain before that.
+- A rocket explodes at the aim point, at the first body, in the terrain, or at the end of its range: 46.1 m from the
+  shooter's centre, on its 50th move (corrected, section 7).
 - Hit test: a point of the path inside the body cylinder (2D ≤ 1 m, between the ground and ground + 2), against
   targets **after** they moved, in sub-steps of 0.50 m. Replaying 15 840 bullets of 12 server matches through the
   model: 98.9 % agreement (0.45 m 98.7 %, 0.67 m 98.6 %, one full 2 m step 89.1 %).
@@ -126,8 +129,10 @@ at the moment of `Zoom`, and regenerates at the end of the tick. Cooldowns drop 
   50-tick band (~30 000 samples).
 
 **Boxes** (`loot.py`, `pickup.py`, `spawn.py`, `dropcontent.py`; 300 matches).
-- 10 boxes at the start anywhere in the arena (3.0–97.0); then 3 every 200 ticks inside the current zone
-  (distance/R ≤ 0.90, (r/R)² mean 0.418 against 0.405 for uniform), at least 1.49 m from a rock edge.
+- 10 boxes at the start anywhere in the arena (3.0–97.0), at least 8.0 m from each other; then 3 every 200 ticks
+  inside the current zone (distance/R ≤ 0.90, (r/R)² mean 0.418 against 0.405 for uniform), at least 1.5 m from a
+  rock edge and at least 4.0 m from every box already on the map. A box that finds no such place (40 random tries)
+  is not spawned, so in a small zone fewer than 3 appear (`latelot*.py`; corrected, see section 7).
 - Kinds (11 246 boxes): ammo 45.7 %, rockets 29.8 %, repair 24.5 %.
 - A dead shtemer drops one box where it died: rockets if it had at least one, otherwise ammo (33/33), with the
   standard amount (27/27). Dropped boxes count towards the limit of 16 (spawn 14 → 2, 15 → 1, 16 → 0).
@@ -202,3 +207,70 @@ The tick order in `Match.cs`: senses (blips from the state at the start of the t
 `OnMessage`, `OnHit`, `OnCollision`, `OnTick` under one budget → projectiles from the shooters' start positions →
 energy, look, movement, collisions → projectile flight (hits on moved targets) → zone damage → pickups → deaths, box
 drops, eliminations → box spawn → cooldowns.
+
+## 7. Corrections
+
+### 2026-10-09: late boxes, pistol and rocket range
+
+An outside comparison reported that the simulator made about 3× more boxes than the server near tick 2600. Checking
+it found two loot rules and one range rule that were missing. All numbers below can be repeated with the scripts
+named.
+
+**Box spacing** (`latelot.py`, `latelot2.py`, `latelot3.py`; 3 000 ranked replays, 81 608 spawned boxes).
+- What was wrong: the simulator placed 3 boxes every 200 ticks wherever they fell in 0.9·R. When all 100 tries hit
+  a rock, it kept the last try, so a few boxes landed inside rocks (clearance down to −0.8 m).
+- Evidence: a spawned box is never closer than 4.0 m to another box (p0.1 4.01 m; fewer than 0.1 % are closer,
+  down to 2.06 m, not explained). Initial boxes are never closer than 8.0 m to each other (p0 8.00 m).
+  In the last shrink (tick 2600, R = 1.83, so the spawn disk has radius 1.65 m) the server spawned 0 or 1 box,
+  never 2 or 3 (491 matches: 164 × 0, 327 × 1; mean 0.67).
+- Number of tries: replaying every ranked spawn tick (state from the frame before) through the model with K tries
+  per box. For R 4–5 (spawn counts 0/1/2/3 when the cap of 16 does not bind): server 1/2/40/177, K = 30 gives
+  1/3/42/174, K = 100 gives 1/2/28/189; for R 5–8 the server has 19 spawns of 2, K = 30 gives 34, K = 100 gives 10.
+  The simulator uses 40.
+- After R reaches 0 (tick 2700) the spawn point is the zone centre, so at most one box can sit there.
+
+| spawned boxes per spawn tick (mean) | server | before | after |
+|---|---|---|---|
+| tick 2400 (R 4.58), ranked vs 200 local matches with other fleets | 2.81 (cap not binding) | 3.00 | 2.75 |
+| tick 2600 (R 1.83), same | 0.67 | 2.96 | 0.83 |
+| tick 2600, 12 server test matches vs the same setups played 16× locally | 0.82 | 2.89 | 0.96 |
+
+In `--replay` mode the simulator also used to top up the server's 0–1 late boxes with generated ones up to 3; the
+generated ones now follow the same spacing, so they are rejected where the server had no room either.
+
+**Pistol range** (`range.py`; 70 567 bullets of the 12 test matches and 40 ranked replays).
+- What was wrong: the simulator removed a bullet as soon as its path passed 30 m from the shooter's centre, in the
+  middle of the move. Hits were possible only up to 29.6 m.
+- Evidence: each bullet was run through the hit model with the range extended to 34 m, and the predicted hits were
+  compared with the server's hit events. Predicted hits on the path 29.6–31.1 m: server confirmed 157 of 168 (93 %,
+  the same rate as at 25–29 m); 31.1–34 m: 1 of 119. The last frame in which a bullet is seen is 29.1 m from the
+  centre (13 ticks after `Fire`), so the bullet is removed at the end of the move that takes it to 31.1 m.
+  The server registers 235 pistol hits 14 ticks after `Fire` in this sample (the 15th move).
+- Same check on local replays: before 0 of 72 hits beyond 29.6 m, after 58 of 61.
+
+**Rocket range** (3 000 ranked replays, 240 rockets aimed 40 m or farther).
+- What was wrong: a rocket aimed beyond its range exploded 45.0 m from the shooter's centre, on its 49th move.
+- Evidence: on the server such rockets explode 46.08–46.10 m from the centre, 49 ticks after `Fire` (the 50th move:
+  1.1 + 50 × 0.9). A rocket aimed at 45.2–45.9 m explodes at its aim point. So the range of 45 m counts from the
+  muzzle, as for the pistol (1.1 + 30 = 31.1).
+- After: a probe fleet firing at points 60 m away explodes at 46.10 m on the 50th move.
+
+**Timing checked, no change.** A projectile is created in the tick of `Fire` and moves once in that tick; the shortest
+interval between two shots of one shtemer is 8 ticks for the pistol (55 045 cases) and 50 for the rocket, on the
+server and locally. Rockets that hit nothing explode at the aim point (distance error 0.000 m) in the predicted tick
+in 96.7 % of cases (1 280 of 1 324; the rest end earlier, for example on a rock).
+
+**Effect on the same-setup check** (12 server test matches, each setup played 16 times locally with the same seeds
+before and after):
+
+| | server | before | after |
+|---|---|---|---|
+| deaths per match, pistol / rocket / zone | 14.08 / 1.33 / 6.75 | 13.76 / 1.81 / 6.64 | 14.10 / 1.81 / 6.41 |
+| match length, ticks | 2 648 ± 39 | 2 625 ± 123 | 2 628 ± 116 |
+| server place as a quantile of the local places (0.5 typical), six fleets | | 0.66 0.43 0.48 0.40 0.49 0.46 | 0.64 0.43 0.50 0.39 0.47 0.48 |
+
+`pistolhits3.py` now follows the corrected range (15 moves, the last one checked whole); the 98.9 % agreement in
+section 3 was measured with the old cut at 30 m and has not been re-run.
+
+Determinism holds after the change (same seed twice: identical md5 for generated, `--arenas` and `--replay` matches).
+

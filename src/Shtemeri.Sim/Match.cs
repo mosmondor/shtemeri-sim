@@ -355,7 +355,9 @@ public sealed class Match
             Speed = (rocket ? Rules.RocketSpeed : Rules.PistolSpeed) * _dt,
             X = mx + dx * Rules.MuzzleOffset, Y = my + dy * Rules.MuzzleOffset, Z = mz + dz * Rules.MuzzleOffset,
             Traveled = Rules.MuzzleOffset,
-            MaxTravel = rocket ? Math.Min(Rules.RocketRange, len) : Rules.PistolRange,
+            // range counts from the muzzle (server: rockets end at most 46.1 m from the shooter's centre on the
+            // 50th move, pistol bullets hit up to 31.1 m on the 15th; calib/range.py)
+            MaxTravel = rocket ? Math.Min(Rules.MuzzleOffset + Rules.RocketRange, len) : Rules.MuzzleOffset + Rules.PistolRange,
         };
         _projectiles.Add(p);
     }
@@ -470,8 +472,9 @@ public sealed class Match
                 if (p.Kind == 1) step = Math.Min(step, p.MaxTravel - p.Traveled);
                 remaining -= sub;
                 p.X += p.Dx * step; p.Y += p.Dy * step; p.Z += p.Dz * step; p.Traveled += step;
-                bool reachedEnd = p.Traveled >= p.MaxTravel - 1e-9;
-                if (p.Kind == 0 && p.Traveled > p.MaxTravel + 1e-9) { p.Alive = false; break; }
+                // rocket: explodes at its end point (target or range). Pistol: the whole step is checked for hits,
+                // and the bullet is removed after the step that reaches its range.
+                bool reachedEnd = p.Kind == 1 && p.Traveled >= p.MaxTravel - 1e-9;
 
                 bool stop = p.X < 0 || p.Y < 0 || p.X > size || p.Y > size
                             || p.Z < Arena.Height(p.X, p.Y)
@@ -507,12 +510,9 @@ public sealed class Match
                     break;
                 }
                 if (stop) { if (p.Kind == 1) Explode(p); else p.Alive = false; break; }
-                if (reachedEnd)
-                {
-                    if (p.Kind == 1) Explode(p); else p.Alive = false;
-                    break;
-                }
+                if (reachedEnd) { Explode(p); break; }
             }
+            if (p.Alive && p.Kind == 0 && p.Traveled >= p.MaxTravel - 1e-9) p.Alive = false;
         }
         _projectiles.RemoveAll(p => !p.Alive);
     }
@@ -661,14 +661,22 @@ public sealed class Match
             if (scheduled != null && i < scheduled.Count) seed = scheduled[i];
             else
             {
-                Vec2 p = z.Center;
-                for (int tries = 0; tries < 100; tries++)
+                // As on the server (calib/latelot3.py): a spawned box keeps 4 m from every other box and 1.5 m from
+                // rocks; a box that finds no such place in its tries is not spawned. In a small zone (R < 2.2,
+                // R = 0 after t = 2700) at most one box fits, so late spawns are 0-1 instead of 3.
+                Vec2? found = null;
+                double sp2 = Rules.LootSpawnSpacing * Rules.LootSpawnSpacing;
+                for (int tries = 0; tries < Rules.LootSpawnTries && found == null; tries++)
                 {
-                    p = z.Center + _rng.InDisk(z.Radius * Rules.LootSpawnZoneFraction);
+                    var p = z.Center + _rng.InDisk(z.Radius * Rules.LootSpawnZoneFraction);
                     if (p.X < 1 || p.Y < 1 || p.X > Rules.ArenaSize - 1 || p.Y > Rules.ArenaSize - 1) continue;
-                    if (Arena.InsideRock(p.X, p.Y, Rules.LootRockClearance) < 0) break;
+                    if (Arena.InsideRock(p.X, p.Y, Rules.LootRockClearance) >= 0) continue;
+                    bool near = false;
+                    foreach (var o in _boxes) if ((o.Pos - p).LengthSquared < sp2) { near = true; break; }
+                    if (!near) found = p;
                 }
-                seed = new LootSeed(MatchSetup.PickKind(_rng, Rules), p);
+                if (found == null) continue;
+                seed = new LootSeed(MatchSetup.PickKind(_rng, Rules), found.Value);
             }
             _boxes.Add(new Box { Id = _nextBoxId++, Kind = seed.Kind, Pos = seed.Position });
         }

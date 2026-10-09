@@ -51,7 +51,9 @@ public sealed class MatchSetup
             {
                 p = new Vec2(rng.Range(rules.LootWallMargin, rules.ArenaSize - rules.LootWallMargin),
                              rng.Range(rules.LootWallMargin, rules.ArenaSize - rules.LootWallMargin));
-                if (arena.InsideRock(p.X, p.Y, rules.LootRockClearance) < 0) break;
+                if (arena.InsideRock(p.X, p.Y, rules.LootRockClearance) >= 0) continue;
+                double s2 = rules.LootInitialSpacing * rules.LootInitialSpacing;
+                if (loot.All(l => (l.Position - p).LengthSquared >= s2)) break;
             }
             loot.Add(new LootSeed(PickKind(rng, rules), p));
         }

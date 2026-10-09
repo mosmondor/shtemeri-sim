@@ -93,6 +93,12 @@ public sealed class SimRules : IRules
     public double LootSpawnZoneFraction { get; init; } = 0.9;
     /// <summary>Minimum clearance between a spawned box and the edge of a rock.</summary>
     public double LootRockClearance { get; init; } = 1.5;
+    /// <summary>A spawned box keeps at least this far from every box on the map (server: minimum 4.0 m).</summary>
+    public double LootSpawnSpacing { get; init; } = 4.0;
+    /// <summary>Random places tried per spawned box; a box with no valid place is not spawned.</summary>
+    public int LootSpawnTries { get; init; } = 40;
+    /// <summary>Initial boxes keep at least this far from each other (server: minimum 8.0 m).</summary>
+    public double LootInitialSpacing { get; init; } = 8.0;
     /// <summary>Initial boxes keep this far from the arena wall.</summary>
     public double LootWallMargin { get; init; } = 3.0;
     /// <summary>Kind probabilities of spawned boxes: Ammo, Rockets, Repair.</summary>
